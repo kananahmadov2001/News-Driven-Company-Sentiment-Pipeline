@@ -16,13 +16,26 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional
-from urllib.parse import quote
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 from kafka import KafkaProducer
 
 
 LOGGER = logging.getLogger("news_producer")
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_gdelt_dt(value: str) -> str:
+    if not value:
+        return _now_utc_iso()
+    try:
+        return datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return _now_utc_iso()
 
 
 @dataclass
@@ -58,7 +71,7 @@ class Article:
             "language": self.language,
             "country": self.country,
             "raw_json": self.raw_json,
-            "event_ingested_at": datetime.now(timezone.utc).isoformat(),
+            "event_ingested_at": _now_utc_iso(),
         }
         payload["event_id"] = hashlib.sha256(
             f"{payload['provider']}|{payload['url']}|{payload['published_at']}".encode("utf-8")
@@ -79,7 +92,7 @@ class NewsApiClient(SourceClient):
     def fetch(self) -> Iterable[Article]:
         now = datetime.now(timezone.utc)
         from_dt = (now - timedelta(minutes=15)).isoformat(timespec="seconds")
-        query = quote(self.query)
+        query = quote_plus(self.query)
         url = (
             "https://newsapi.org/v2/everything"
             f"?q={query}&from={from_dt}&sortBy=publishedAt&pageSize=100&language=en"
@@ -95,7 +108,7 @@ class NewsApiClient(SourceClient):
             yield Article(
                 provider="newsapi",
                 provider_article_id=f"newsapi-{idx}-{row.get('publishedAt', '')}",
-                published_at=row.get("publishedAt") or now.isoformat(),
+                published_at=row.get("publishedAt") or _now_utc_iso(),
                 title=row.get("title") or "",
                 description=row.get("description") or "",
                 content=row.get("content") or "",
@@ -109,8 +122,9 @@ class NewsApiClient(SourceClient):
 
 
 class RssClient(SourceClient):
-    def __init__(self, feed_urls: List[str]):
+    def __init__(self, feed_urls: List[str], provider: str = "rss"):
         self.feed_urls = feed_urls
+        self.provider = provider
 
     def _parse_item(self, item: Dict, fallback_source: str) -> Optional[Article]:
         link = item.get("link")
@@ -118,16 +132,17 @@ class RssClient(SourceClient):
             return None
 
         published = item.get("published") or item.get("pubDate")
-        published_at = datetime.now(timezone.utc).isoformat()
+        published_at = _now_utc_iso()
         if published:
             try:
                 published_at = parsedate_to_datetime(published).astimezone(timezone.utc).isoformat()
             except Exception:
                 pass
 
+        provider_id = item.get("id") or item.get("guid") or hashlib.sha256(link.encode("utf-8")).hexdigest()
         return Article(
-            provider="rss",
-            provider_article_id=hashlib.sha256(link.encode("utf-8")).hexdigest(),
+            provider=self.provider,
+            provider_article_id=str(provider_id),
             published_at=published_at,
             title=item.get("title") or "",
             description=item.get("summary") or item.get("description") or "",
@@ -145,11 +160,54 @@ class RssClient(SourceClient):
 
         for feed_url in self.feed_urls:
             parsed = feedparser.parse(feed_url)
-            fallback_source = (parsed.feed or {}).get("title", "rss")
+            fallback_source = (parsed.feed or {}).get("title", self.provider)
             for item in parsed.entries:
                 article = self._parse_item(item, fallback_source)
                 if article:
                     yield article
+
+
+class GdeltApiClient(SourceClient):
+    def __init__(self, query: str, max_records: int = 100, lookback_minutes: int = 120):
+        self.query = query
+        self.max_records = max_records
+        self.lookback_minutes = lookback_minutes
+
+    def _build_url(self) -> str:
+        encoded_query = quote_plus(self.query)
+        return (
+            "https://api.gdeltproject.org/api/v2/doc/doc"
+            f"?query={encoded_query}&mode=ArtList&format=json"
+            f"&maxrecords={self.max_records}&sort=datedesc&timespan={self.lookback_minutes}min"
+        )
+
+    def fetch(self) -> Iterable[Article]:
+        req = Request(self._build_url())
+        with urlopen(req, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        for row in payload.get("articles", []):
+            article_url = row.get("url")
+            if not article_url:
+                continue
+            seen_date = row.get("seendate", "")
+            title = row.get("title") or ""
+            desc = row.get("socialimage") or row.get("excerpt") or ""
+            source_name = row.get("domain") or row.get("sourcecountry") or "gdelt"
+            yield Article(
+                provider="gdelt",
+                provider_article_id=hashlib.sha256(f"{article_url}|{seen_date}".encode("utf-8")).hexdigest(),
+                published_at=_parse_gdelt_dt(seen_date),
+                title=title,
+                description=desc,
+                content=desc,
+                source_name=source_name,
+                url=article_url,
+                author="",
+                language=row.get("language") or "en",
+                country=row.get("sourcecountry") or "",
+                raw_json=row,
+            )
 
 
 class DedupState:
@@ -168,7 +226,6 @@ class DedupState:
             return False
         self._seen[key] = time.time()
         if len(self._seen) > self.max_keys:
-            # remove oldest ~10%
             sorted_keys = sorted(self._seen.items(), key=lambda kv: kv[1])
             for old_key, _ in sorted_keys[: max(1, self.max_keys // 10)]:
                 self._seen.pop(old_key, None)
@@ -190,22 +247,37 @@ class ProducerApp:
         )
         self.state = DedupState()
 
+    def _run_once(self) -> None:
+        fetched = 0
+        dedup_dropped = 0
+        published = 0
+        for article in self.source_client.fetch():
+            fetched += 1
+            if not self.state.is_new(article):
+                dedup_dropped += 1
+                continue
+            event = article.as_event()
+            self.producer.send(self.topic, key=article.stable_key, value=event)
+            published += 1
+        self.producer.flush()
+        LOGGER.info(
+            "Producer iteration complete fetched=%s dedup_dropped=%s published=%s",
+            fetched,
+            dedup_dropped,
+            published,
+        )
+
     def run_forever(self, poll_seconds: int) -> None:
         LOGGER.info("Starting producer loop with poll interval=%ss", poll_seconds)
         while True:
-            published = 0
             try:
-                for article in self.source_client.fetch():
-                    if not self.state.is_new(article):
-                        continue
-                    event = article.as_event()
-                    self.producer.send(self.topic, key=article.stable_key, value=event)
-                    published += 1
-                self.producer.flush()
-                LOGGER.info("Published %s new article events", published)
+                self._run_once()
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Producer iteration failed: %s", exc)
             time.sleep(poll_seconds)
+
+    def run_once(self) -> None:
+        self._run_once()
 
 
 def build_source_from_env(source: str) -> SourceClient:
@@ -219,9 +291,24 @@ def build_source_from_env(source: str) -> SourceClient:
     if source == "rss":
         urls = os.environ.get(
             "RSS_FEED_URLS",
-            "https://feeds.reuters.com/reuters/businessNews,https://feeds.reuters.com/reuters/technologyNews",
+            "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml,https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
         )
-        return RssClient(feed_urls=[part.strip() for part in urls.split(",") if part.strip()])
+        return RssClient(feed_urls=[part.strip() for part in urls.split(",") if part.strip()], provider="rss")
+
+    if source == "gdelt":
+        query = os.environ.get(
+            "GDELT_QUERY",
+            '("stock market" OR earnings OR inflation OR "Federal Reserve" OR Apple OR Microsoft OR NVIDIA)',
+        )
+        max_records = int(os.environ.get("GDELT_MAX_RECORDS_PER_POLL", "100"))
+        lookback_minutes = int(os.environ.get("GDELT_LOOKBACK_MINUTES", "180"))
+        gdelt_mode = os.environ.get("GDELT_MODE", "docapi").lower()
+        if gdelt_mode == "rssarchive":
+            urls = os.environ.get("GDELT_RSS_FEED_URLS", "").strip()
+            if not urls:
+                raise RuntimeError("Set GDELT_RSS_FEED_URLS when GDELT_MODE=rssarchive")
+            return RssClient(feed_urls=[part.strip() for part in urls.split(",") if part.strip()], provider="gdelt")
+        return GdeltApiClient(query=query, max_records=max_records, lookback_minutes=lookback_minutes)
 
     raise ValueError(f"Unsupported source: {source}")
 
@@ -231,7 +318,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kafka-bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     parser.add_argument("--topic", default=os.environ.get("RAW_ARTICLES_TOPIC", "raw_news_articles"))
     parser.add_argument("--poll-seconds", type=int, default=int(os.environ.get("POLL_SECONDS", "60")))
-    parser.add_argument("--source", choices=["newsapi", "rss"], default=os.environ.get("SOURCE_TYPE", "rss"))
+    parser.add_argument("--source", choices=["newsapi", "rss", "gdelt"], default=os.environ.get("SOURCE_TYPE", "gdelt"))
+    parser.add_argument("--run-once", action="store_true", help="Run one poll iteration and exit")
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     return parser.parse_args()
 
@@ -249,6 +337,9 @@ def main() -> None:
         topic=args.topic,
         source_client=source_client,
     )
+    if args.run_once:
+        app.run_once()
+        return
     app.run_forever(poll_seconds=args.poll_seconds)
 
 

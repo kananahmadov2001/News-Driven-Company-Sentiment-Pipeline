@@ -30,6 +30,16 @@ This supports CSE 5114's real-time/distributed systems requirement while preserv
    - `mart_company_sentiment_hour` (hourly aggregates)
    - Existing dashboard queries can pivot from daily to minute/hour marts.
 
+## Demo-ready operating model
+
+For LinuxLab's limited session duration, run this sequence:
+
+1. **Smoke path**: publish exactly one synthetic event with Python to prove Kafka -> Spark -> Snowflake.
+2. **Backfill path**: run one-shot GDELT backfill for 7/14/30 days (configurable caps) to preload demo data.
+3. **Live tail path**: keep GDELT live producer running for near-real-time updates.
+
+This avoids demo risk from quiet external feeds while still satisfying real-time architecture goals.
+
 ## Why Spark for this project
 - Team is already using Python and SQL-centric transformations.
 - Structured Streaming offers a familiar DataFrame model.
@@ -65,12 +75,14 @@ This supports CSE 5114's real-time/distributed systems requirement while preserv
 
 ## Files added in this repo
 - `streaming/producer/news_producer.py` - source polling publisher to Kafka.
+- `streaming/producer/smoke_event_producer.py` - one-shot synthetic event publisher.
+- `streaming/producer/gdelt_backfill.py` - one-shot historical backfill publisher.
 - `streaming/processor/spark_news_stream.py` - Spark streaming processor to Snowflake.
 - `streaming/sql/01_create_realtime_tables.sql` - realtime table DDL.
 - `streaming/requirements.txt` - Python dependencies.
 
 ## Suggested demo narrative for presentation
-1. Show producer publishing to Kafka every minute.
-2. Show Spark job consuming and writing minute aggregates.
-3. Query Snowflake for last 15 minutes of per-company sentiment.
-4. Explain how this still reuses your existing Snowflake-centric architecture.
+1. Show smoke event arriving end-to-end.
+2. Show backfill preloading enough historical examples.
+3. Show live producer publishing new updates.
+4. Show minute-level Snowflake aggregates updating.

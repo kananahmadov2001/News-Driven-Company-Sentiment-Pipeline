@@ -10,6 +10,7 @@ Pipeline stages:
 
 from __future__ import annotations
 
+import logging
 import os
 import pandas as pd
 import snowflake.connector
@@ -17,6 +18,9 @@ from snowflake.connector.pandas_tools import write_pandas
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
+
+
+LOGGER = logging.getLogger("spark_news_stream")
 
 
 RAW_ARTICLE_SCHEMA = StructType(
@@ -66,6 +70,7 @@ def load_kafka_stream(spark: SparkSession) -> DataFrame:
         .option("kafka.bootstrap.servers", os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
         .option("subscribe", os.environ.get("RAW_ARTICLES_TOPIC", "raw_news_articles"))
         .option("startingOffsets", os.environ.get("KAFKA_STARTING_OFFSETS", "latest"))
+        .option("maxOffsetsPerTrigger", os.environ.get("MAX_OFFSETS_PER_TRIGGER", "2000"))
         .load()
     )
 
@@ -129,6 +134,7 @@ def match_companies(df: DataFrame, aliases: DataFrame) -> DataFrame:
 
 def write_batch_to_snowflake(batch_df: DataFrame, batch_id: int) -> None:
     if batch_df.rdd.isEmpty():
+        LOGGER.info("Skipping empty micro-batch batch_id=%s", batch_id)
         return
 
     article_pdf = (
@@ -178,6 +184,11 @@ def write_batch_to_snowflake(batch_df: DataFrame, batch_id: int) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
     spark = build_spark()
     raw = load_kafka_stream(spark)
     normalized = parse_and_normalize(raw)
