@@ -4,13 +4,16 @@ Pipeline stages:
 1. Read raw article events from Kafka topic raw_news_articles.
 2. Clean/normalize fields and deduplicate by URL hash.
 3. Perform company matching using alias dimension loaded from Snowflake.
-4. Compute sentiment score (baseline rule model).
+4. Compute sentiment score.
 5. Upsert article-level and aggregate results into Snowflake.
 """
 
 from __future__ import annotations
 
 import os
+import pandas as pd
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
@@ -33,6 +36,18 @@ RAW_ARTICLE_SCHEMA = StructType(
         StructField("event_ingested_at", StringType()),
     ]
 )
+
+
+def sf_connect():
+    return snowflake.connector.connect(
+        user=os.environ["SNOWFLAKE_USER"],
+        password=os.environ["SNOWFLAKE_PASSWORD"],
+        account=os.environ["SNOWFLAKE_ACCOUNT"],
+        warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "MONKEY_WH"),
+        database=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
+        schema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
+        role=os.environ.get("SNOWFLAKE_ROLE", "TRAINING_ROLE"),
+    )
 
 
 def build_spark() -> SparkSession:
@@ -87,20 +102,19 @@ def add_rule_sentiment(df: DataFrame) -> DataFrame:
 
 
 def load_company_aliases(spark: SparkSession) -> DataFrame:
-    return (
-        spark.read.format("snowflake")
-        .options(
-            sfURL=os.environ["SNOWFLAKE_URL"],
-            sfUser=os.environ["SNOWFLAKE_USER"],
-            sfPassword=os.environ["SNOWFLAKE_PASSWORD"],
-            sfDatabase=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
-            sfSchema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
-            sfWarehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-            dbtable=os.environ.get("COMPANY_ALIAS_TABLE", "company_alias"),
-        )
-        .load()
-        .select(F.col("company_id"), F.lower(F.col("alias")).alias("alias_norm"))
-    )
+    table_name = os.environ.get("COMPANY_ALIAS_TABLE", "dim_company_aliases")
+    sql = f"""
+        SELECT company_id, LOWER(alias) AS alias_norm
+        FROM {table_name}
+    """
+
+    conn = sf_connect()
+    try:
+        pdf = conn.cursor().execute(sql).fetch_pandas_all()
+    finally:
+        conn.close()
+
+    return spark.createDataFrame(pdf)
 
 
 def match_companies(df: DataFrame, aliases: DataFrame) -> DataFrame:
@@ -115,36 +129,50 @@ def write_batch_to_snowflake(batch_df: DataFrame, batch_id: int) -> None:
     if batch_df.rdd.isEmpty():
         return
 
-    article_level_table = os.environ.get("ARTICLE_MATCH_TABLE", "article_company_match")
+    article_pdf = (
+        batch_df.select(
+            "event_id",
+            "url_hash",
+            "published_at_ts",
+            "company_id",
+            "sentiment_score",
+            "source_name",
+        )
+        .dropDuplicates(["event_id", "company_id"])
+        .toPandas()
+    )
 
-    (batch_df.write.format("snowflake").mode("append").options(
-        sfURL=os.environ["SNOWFLAKE_URL"],
-        sfUser=os.environ["SNOWFLAKE_USER"],
-        sfPassword=os.environ["SNOWFLAKE_PASSWORD"],
-        sfDatabase=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
-        sfSchema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
-        sfWarehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-        dbtable=article_level_table,
-    ).save())
-
-    minute_mart = (
+    minute_pdf = (
         batch_df.withColumn("bucket_minute", F.date_trunc("minute", F.col("published_at_ts")))
         .groupBy("bucket_minute", "company_id")
         .agg(
             F.countDistinct("url_hash").alias("article_count"),
             F.avg("sentiment_score").alias("avg_sentiment"),
         )
+        .toPandas()
     )
 
-    (minute_mart.write.format("snowflake").mode("append").options(
-        sfURL=os.environ["SNOWFLAKE_URL"],
-        sfUser=os.environ["SNOWFLAKE_USER"],
-        sfPassword=os.environ["SNOWFLAKE_PASSWORD"],
-        sfDatabase=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
-        sfSchema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
-        sfWarehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
-        dbtable=os.environ.get("MART_MINUTE_TABLE", "mart_company_sentiment_minute"),
-    ).save())
+    conn = sf_connect()
+    try:
+        if not article_pdf.empty:
+            write_pandas(
+                conn,
+                article_pdf,
+                os.environ.get("ARTICLE_MATCH_TABLE", "article_company_match"),
+                auto_create_table=False,
+                overwrite=False,
+            )
+
+        if not minute_pdf.empty:
+            write_pandas(
+                conn,
+                minute_pdf,
+                os.environ.get("MART_MINUTE_TABLE", "mart_company_sentiment_minute"),
+                auto_create_table=False,
+                overwrite=False,
+            )
+    finally:
+        conn.close()
 
 
 def main() -> None:
