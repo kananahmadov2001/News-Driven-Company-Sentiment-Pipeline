@@ -1,0 +1,168 @@
+"""Spark Structured Streaming processor for Kafka -> Snowflake.
+
+Pipeline stages:
+1. Read raw article events from Kafka topic raw_news_articles.
+2. Clean/normalize fields and deduplicate by URL hash.
+3. Perform company matching using alias dimension loaded from Snowflake.
+4. Compute sentiment score (baseline rule model).
+5. Upsert article-level and aggregate results into Snowflake.
+"""
+
+from __future__ import annotations
+
+import os
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, StructField, StructType
+
+
+RAW_ARTICLE_SCHEMA = StructType(
+    [
+        StructField("event_id", StringType()),
+        StructField("provider", StringType()),
+        StructField("provider_article_id", StringType()),
+        StructField("published_at", StringType()),
+        StructField("title", StringType()),
+        StructField("description", StringType()),
+        StructField("content", StringType()),
+        StructField("source_name", StringType()),
+        StructField("url", StringType()),
+        StructField("author", StringType()),
+        StructField("language", StringType()),
+        StructField("country", StringType()),
+        StructField("event_ingested_at", StringType()),
+    ]
+)
+
+
+def build_spark() -> SparkSession:
+    return (
+        SparkSession.builder.appName("news-stream-processor")
+        .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "8"))
+        .getOrCreate()
+    )
+
+
+def load_kafka_stream(spark: SparkSession) -> DataFrame:
+    return (
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
+        .option("subscribe", os.environ.get("RAW_ARTICLES_TOPIC", "raw_news_articles"))
+        .option("startingOffsets", os.environ.get("KAFKA_STARTING_OFFSETS", "latest"))
+        .load()
+    )
+
+
+def parse_and_normalize(raw_df: DataFrame) -> DataFrame:
+    parsed = raw_df.select(
+        F.col("timestamp").alias("kafka_timestamp"),
+        F.from_json(F.col("value").cast("string"), RAW_ARTICLE_SCHEMA).alias("v"),
+    ).select("kafka_timestamp", "v.*")
+
+    normalized = (
+        parsed.withColumn("published_at_ts", F.to_timestamp("published_at"))
+        .withColumn("event_ingested_at_ts", F.to_timestamp("event_ingested_at"))
+        .withColumn("url_hash", F.sha2(F.lower(F.trim(F.col("url"))), 256))
+        .withColumn(
+            "article_text",
+            F.concat_ws(" ", F.coalesce("title", F.lit("")), F.coalesce("description", F.lit("")), F.coalesce("content", F.lit(""))),
+        )
+        .dropna(subset=["url", "title"])
+        .dropDuplicates(["url_hash"])
+    )
+    return normalized
+
+
+def add_rule_sentiment(df: DataFrame) -> DataFrame:
+    positive_words = ["beat", "surge", "growth", "upgraded", "profit", "rally"]
+    negative_words = ["miss", "plunge", "layoff", "downgrade", "loss", "lawsuit"]
+
+    positive_score = sum(F.when(F.lower(F.col("article_text")).contains(w), F.lit(1)).otherwise(F.lit(0)) for w in positive_words)
+    negative_score = sum(F.when(F.lower(F.col("article_text")).contains(w), F.lit(1)).otherwise(F.lit(0)) for w in negative_words)
+
+    return (
+        df.withColumn("sentiment_raw", positive_score - negative_score)
+        .withColumn("sentiment_score", F.when(F.col("sentiment_raw") > 0, F.lit(1.0)).when(F.col("sentiment_raw") < 0, F.lit(-1.0)).otherwise(F.lit(0.0)))
+    )
+
+
+def load_company_aliases(spark: SparkSession) -> DataFrame:
+    return (
+        spark.read.format("snowflake")
+        .options(
+            sfURL=os.environ["SNOWFLAKE_URL"],
+            sfUser=os.environ["SNOWFLAKE_USER"],
+            sfPassword=os.environ["SNOWFLAKE_PASSWORD"],
+            sfDatabase=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
+            sfSchema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
+            sfWarehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+            dbtable=os.environ.get("COMPANY_ALIAS_TABLE", "company_alias"),
+        )
+        .load()
+        .select(F.col("company_id"), F.lower(F.col("alias")).alias("alias_norm"))
+    )
+
+
+def match_companies(df: DataFrame, aliases: DataFrame) -> DataFrame:
+    return (
+        df.crossJoin(F.broadcast(aliases))
+        .where(F.instr(F.lower(F.col("article_text")), F.col("alias_norm")) > 0)
+        .select("event_id", "url_hash", "published_at_ts", "company_id", "sentiment_score", "source_name")
+    )
+
+
+def write_batch_to_snowflake(batch_df: DataFrame, batch_id: int) -> None:
+    if batch_df.rdd.isEmpty():
+        return
+
+    article_level_table = os.environ.get("ARTICLE_MATCH_TABLE", "article_company_match")
+
+    (batch_df.write.format("snowflake").mode("append").options(
+        sfURL=os.environ["SNOWFLAKE_URL"],
+        sfUser=os.environ["SNOWFLAKE_USER"],
+        sfPassword=os.environ["SNOWFLAKE_PASSWORD"],
+        sfDatabase=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
+        sfSchema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
+        sfWarehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+        dbtable=article_level_table,
+    ).save())
+
+    minute_mart = (
+        batch_df.withColumn("bucket_minute", F.date_trunc("minute", F.col("published_at_ts")))
+        .groupBy("bucket_minute", "company_id")
+        .agg(
+            F.countDistinct("url_hash").alias("article_count"),
+            F.avg("sentiment_score").alias("avg_sentiment"),
+        )
+    )
+
+    (minute_mart.write.format("snowflake").mode("append").options(
+        sfURL=os.environ["SNOWFLAKE_URL"],
+        sfUser=os.environ["SNOWFLAKE_USER"],
+        sfPassword=os.environ["SNOWFLAKE_PASSWORD"],
+        sfDatabase=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
+        sfSchema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
+        sfWarehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "COMPUTE_WH"),
+        dbtable=os.environ.get("MART_MINUTE_TABLE", "mart_company_sentiment_minute"),
+    ).save())
+
+
+def main() -> None:
+    spark = build_spark()
+    raw = load_kafka_stream(spark)
+    normalized = parse_and_normalize(raw)
+    scored = add_rule_sentiment(normalized)
+    aliases = load_company_aliases(spark)
+    matched = match_companies(scored, aliases)
+
+    query = (
+        matched.writeStream.trigger(processingTime=os.environ.get("PROCESSING_TIME", "45 seconds"))
+        .option("checkpointLocation", os.environ.get("CHECKPOINT_PATH", "/tmp/news-stream-checkpoint"))
+        .foreachBatch(write_batch_to_snowflake)
+        .start()
+    )
+    query.awaitTermination()
+
+
+if __name__ == "__main__":
+    main()
