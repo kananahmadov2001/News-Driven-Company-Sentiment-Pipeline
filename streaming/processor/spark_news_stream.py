@@ -40,13 +40,15 @@ RAW_ARTICLE_SCHEMA = StructType(
 
 def sf_connect():
     return snowflake.connector.connect(
-        user=os.environ["SNOWFLAKE_USER"],
-        password=os.environ["SNOWFLAKE_PASSWORD"],
         account=os.environ["SNOWFLAKE_ACCOUNT"],
-        warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE", "MONKEY_WH"),
-        database=os.environ.get("SNOWFLAKE_DATABASE", "MONKEY_DB"),
-        schema=os.environ.get("SNOWFLAKE_SCHEMA", "FINAL_PROJECT"),
-        role=os.environ.get("SNOWFLAKE_ROLE", "TRAINING_ROLE"),
+        user=os.environ["SNOWFLAKE_USER"],
+        authenticator=os.environ.get("SNOWFLAKE_AUTHENTICATOR", "SNOWFLAKE_JWT"),
+        private_key_file=os.environ["SNOWFLAKE_PRIVATE_KEY_FILE"],
+        private_key_file_pwd=os.environ.get("SNOWFLAKE_PRIVATE_KEY_PWD"),
+        warehouse=os.environ["SNOWFLAKE_WAREHOUSE"],
+        database=os.environ["SNOWFLAKE_DATABASE"],
+        schema=os.environ["SNOWFLAKE_SCHEMA"],
+        role=os.environ["SNOWFLAKE_ROLE"],
     )
 
 
