@@ -30,6 +30,25 @@ CREATE TABLE IF NOT EXISTS article_company_match (
     loaded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
+-- Canonical append-only base sink for realtime streaming writes.
+-- Canonical-key convention: (event_id, company_id)
+CREATE TABLE IF NOT EXISTS article_company_match_base (
+    event_id STRING,
+    provider STRING,
+    provider_article_id STRING,
+    url STRING,
+    url_hash STRING,
+    published_at_ts TIMESTAMP_NTZ,
+    event_ingested_at_ts TIMESTAMP_NTZ,
+    company_id NUMBER,
+    sentiment_score FLOAT,
+    source_name STRING,
+    article_text STRING,
+    ingest_batch_id STRING,
+    loaded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    comment STRING
+);
+
 CREATE TABLE IF NOT EXISTS mart_company_sentiment_minute (
     bucket_minute TIMESTAMP_NTZ,
     company_id NUMBER,
