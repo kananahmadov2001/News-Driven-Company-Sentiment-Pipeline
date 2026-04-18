@@ -86,3 +86,13 @@ This avoids demo risk from quiet external feeds while still satisfying real-time
 2. Show backfill preloading enough historical examples.
 3. Show live producer publishing new updates.
 4. Show minute-level Snowflake aggregates updating.
+
+## LinuxLab alignment notes (April 2026)
+
+- Execution environment is LinuxLab with session bootstrap:
+  `server-airflow25 -c 4`.
+- Kafka + Spark use shared installs at `/opt/kafka` and `/opt/spark`.
+- Spark submit should use standalone master URL:
+  `spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}`.
+- Snowflake writes in the streaming processor are intentionally via the Python connector path in `foreachBatch`, not Spark Snowflake connector.
+- GDELT is the preferred practical source for live-ish demo and backfill; smoke producer remains the deterministic fallback demo path.

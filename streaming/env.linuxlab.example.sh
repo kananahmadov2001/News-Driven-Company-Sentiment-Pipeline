@@ -9,11 +9,16 @@ export KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
 export RAW_ARTICLES_TOPIC="raw_news_articles"
 export BACKFILL_TOPIC="raw_news_articles"
 
+# LinuxLab Spark standalone master URL pattern:
+#   spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}
+# Set this in your session after server-airflow25 -c 4 has started Spark services.
+export SPARK_MASTER_URL="spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}"
+
 export SOURCE_TYPE="gdelt"
 export POLL_SECONDS="60"
 export LOG_LEVEL="INFO"
 
-# GDELT live/backfill defaults
+# GDELT live/backfill defaults (primary practical source for demo/backfill)
 export GDELT_MODE="docapi"
 export GDELT_QUERY='("stock market" OR earnings OR inflation OR "Federal Reserve" OR Apple OR Microsoft OR NVIDIA)'
 export GDELT_LOOKBACK_MINUTES="180"
@@ -38,14 +43,15 @@ export BACKFILL_MAX_EVENTS="5000"
 export BACKFILL_SLEEP_MS="500"
 
 # Snowflake (key-pair auth)
-export SNOWFLAKE_ACCOUNT="SFEDU02-UNB02139"
-export SNOWFLAKE_USER="MONKEY"
-export SNOWFLAKE_DATABASE="MONKEY_DB"
-export SNOWFLAKE_SCHEMA="FINAL_PROJECT"
-export SNOWFLAKE_WAREHOUSE="MONKEY_WH"
-export SNOWFLAKE_ROLE="TRAINING_ROLE"
+# Keep SNOWFLAKE_AUTHENTICATOR as SNOWFLAKE_JWT for key-pair auth.
+export SNOWFLAKE_ACCOUNT="<your_account>"
+export SNOWFLAKE_USER="<your_user>"
+export SNOWFLAKE_DATABASE="<your_database>"
+export SNOWFLAKE_SCHEMA="<your_schema>"
+export SNOWFLAKE_WAREHOUSE="<your_warehouse>"
+export SNOWFLAKE_ROLE="<your_role>"
 export SNOWFLAKE_AUTHENTICATOR="SNOWFLAKE_JWT"
-export SNOWFLAKE_PRIVATE_KEY_FILE="$HOME/airflow25/rsa_key.p8"
+export SNOWFLAKE_PRIVATE_KEY_FILE="$HOME/path/to/rsa_key.p8"
 # export SNOWFLAKE_PRIVATE_KEY_PWD=""
 
 export COMPANY_ALIAS_TABLE="dim_company_aliases"
