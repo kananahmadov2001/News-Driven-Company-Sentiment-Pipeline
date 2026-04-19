@@ -15,12 +15,12 @@ USE SCHEMA FINAL_PROJECT;
 
 MERGE INTO fact_article_company_mentions tgt
 USING (
-    SELECT DISTINCT
+    SELECT
         a.article_id,
         ca.company_id,
         'alias_ilike' AS match_method,
         0.80 AS confidence,
-        ca.alias AS matched_text,
+        LISTAGG(DISTINCT ca.alias, ', ') WITHIN GROUP (ORDER BY ca.alias) AS matched_text,
         LEFT(
             COALESCE(a.title, '') || ' ' ||
             COALESCE(a.description, '') || ' ' ||
@@ -32,6 +32,15 @@ USING (
       ON COALESCE(a.title, '') ILIKE '%' || ca.alias || '%'
       OR COALESCE(a.description, '') ILIKE '%' || ca.alias || '%'
       OR COALESCE(a.content, '') ILIKE '%' || ca.alias || '%'
+    GROUP BY
+        a.article_id,
+        ca.company_id,
+        LEFT(
+            COALESCE(a.title, '') || ' ' ||
+            COALESCE(a.description, '') || ' ' ||
+            COALESCE(a.content, ''),
+            500
+        )
 ) src
 ON tgt.article_id = src.article_id
 AND tgt.company_id = src.company_id
