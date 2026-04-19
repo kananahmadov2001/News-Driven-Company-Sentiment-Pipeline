@@ -15,7 +15,7 @@ export BACKFILL_TOPIC="raw_news_articles"
 export SPARK_MASTER_URL="spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}"
 
 export SOURCE_TYPE="gdelt"
-export POLL_SECONDS="60"
+export POLL_SECONDS="300"
 export LOG_LEVEL="INFO"
 
 # GDELT live/backfill defaults (primary practical source for demo/backfill)
@@ -23,6 +23,9 @@ export GDELT_MODE="docapi"
 export GDELT_QUERY='("stock market" OR earnings OR inflation OR "Federal Reserve" OR Apple OR Microsoft OR NVIDIA)'
 export GDELT_LOOKBACK_MINUTES="60"
 export GDELT_MAX_RECORDS_PER_POLL="25"
+export GDELT_MAX_ATTEMPTS="6"
+export GDELT_BACKOFF_BASE_SEC="5"
+export GDELT_BACKOFF_CAP_SEC="120"
 # export GDELT_RSS_FEED_URLS="https://example.com/gdelt-rss-feed.xml"
 
 # NewsAPI is optional

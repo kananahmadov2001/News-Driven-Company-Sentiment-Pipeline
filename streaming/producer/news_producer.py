@@ -11,12 +11,14 @@ import hashlib
 import json
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Dict, Iterable, List, Optional
 from urllib.parse import quote_plus
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from kafka import KafkaProducer
@@ -168,10 +170,21 @@ class RssClient(SourceClient):
 
 
 class GdeltApiClient(SourceClient):
-    def __init__(self, query: str, max_records: int = 100, lookback_minutes: int = 120):
+    def __init__(
+        self,
+        query: str,
+        max_records: int = 25,
+        lookback_minutes: int = 60,
+        max_attempts: int = 6,
+        backoff_base_sec: float = 5.0,
+        backoff_cap_sec: float = 120.0,
+    ):
         self.query = query
         self.max_records = max_records
         self.lookback_minutes = lookback_minutes
+        self.max_attempts = max(1, max_attempts)
+        self.backoff_base_sec = max(0.1, backoff_base_sec)
+        self.backoff_cap_sec = max(self.backoff_base_sec, backoff_cap_sec)
 
     def _build_url(self) -> str:
         encoded_query = quote_plus(self.query)
@@ -181,10 +194,100 @@ class GdeltApiClient(SourceClient):
             f"&maxrecords={self.max_records}&sort=datedesc&timespan={self.lookback_minutes}min"
         )
 
-    def fetch(self) -> Iterable[Article]:
-        req = Request(self._build_url())
+    def _compute_backoff_sleep(self, attempt: int, retry_after: Optional[float]) -> float:
+        if retry_after is not None and retry_after > 0:
+            base_sleep = min(self.backoff_cap_sec, retry_after)
+        else:
+            base_sleep = min(self.backoff_cap_sec, self.backoff_base_sec * (2 ** max(0, attempt - 1)))
+        jitter = random.uniform(0, min(1.0, base_sleep * 0.2))
+        return min(self.backoff_cap_sec, base_sleep + jitter)
+
+    def _parse_retry_after(self, header_value: Optional[str]) -> Optional[float]:
+        if not header_value:
+            return None
+        value = header_value.strip()
+        if not value:
+            return None
+        try:
+            return max(0.0, float(int(value)))
+        except ValueError:
+            pass
+        try:
+            retry_dt = parsedate_to_datetime(value)
+            if retry_dt.tzinfo is None:
+                retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (retry_dt - datetime.now(timezone.utc)).total_seconds())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _request_payload(self) -> Dict:
+        req = Request(
+            self._build_url(),
+            headers={
+                "User-Agent": "cse5114-final-project-news-producer/1.0 (+https://github.com/KennyRao/cse5114_final_project)",
+                "Accept": "application/json",
+            },
+        )
         with urlopen(req, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            body = response.read().decode("utf-8", errors="replace")
+        if not body.strip():
+            raise ValueError("GDELT returned empty response body")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"GDELT returned malformed JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"GDELT returned unexpected JSON payload type: {type(payload).__name__}")
+        articles = payload.get("articles")
+        if articles is None:
+            payload["articles"] = []
+            return payload
+        if not isinstance(articles, list):
+            raise ValueError("GDELT payload field 'articles' is not a list")
+        return payload
+
+    def fetch(self) -> Iterable[Article]:
+        payload: Optional[Dict] = None
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            retry_after: Optional[float] = None
+            should_retry = False
+            try:
+                payload = self._request_payload()
+                break
+            except HTTPError as exc:
+                last_error = exc
+                retry_after = self._parse_retry_after(exc.headers.get("Retry-After")) if exc.headers else None
+                should_retry = exc.code == 429 or 500 <= exc.code < 600
+                if not should_retry:
+                    raise
+                reason = f"HTTP {exc.code}"
+            except URLError as exc:
+                last_error = exc
+                should_retry = True
+                reason = f"URLError ({exc.reason})"
+            except ValueError as exc:
+                last_error = exc
+                should_retry = True
+                reason = str(exc)
+
+            if not should_retry:
+                break
+            if attempt >= self.max_attempts:
+                break
+            sleep_sec = self._compute_backoff_sleep(attempt, retry_after=retry_after)
+            LOGGER.warning(
+                "GDELT fetch retry attempt=%s/%s reason=%s sleep_sec=%.2f",
+                attempt,
+                self.max_attempts,
+                reason,
+                sleep_sec,
+            )
+            time.sleep(sleep_sec)
+
+        if payload is None:
+            raise RuntimeError(f"GDELT fetch failed after {self.max_attempts} attempts: {last_error}") from last_error
 
         for row in payload.get("articles", []):
             article_url = row.get("url")
@@ -300,15 +403,25 @@ def build_source_from_env(source: str) -> SourceClient:
             "GDELT_QUERY",
             '("stock market" OR earnings OR inflation OR "Federal Reserve" OR Apple OR Microsoft OR NVIDIA)',
         )
-        max_records = int(os.environ.get("GDELT_MAX_RECORDS_PER_POLL", "100"))
-        lookback_minutes = int(os.environ.get("GDELT_LOOKBACK_MINUTES", "180"))
+        max_records = int(os.environ.get("GDELT_MAX_RECORDS_PER_POLL", "25"))
+        lookback_minutes = int(os.environ.get("GDELT_LOOKBACK_MINUTES", "60"))
+        max_attempts = int(os.environ.get("GDELT_MAX_ATTEMPTS", "6"))
+        backoff_base_sec = float(os.environ.get("GDELT_BACKOFF_BASE_SEC", "5"))
+        backoff_cap_sec = float(os.environ.get("GDELT_BACKOFF_CAP_SEC", "120"))
         gdelt_mode = os.environ.get("GDELT_MODE", "docapi").lower()
         if gdelt_mode == "rssarchive":
             urls = os.environ.get("GDELT_RSS_FEED_URLS", "").strip()
             if not urls:
                 raise RuntimeError("Set GDELT_RSS_FEED_URLS when GDELT_MODE=rssarchive")
             return RssClient(feed_urls=[part.strip() for part in urls.split(",") if part.strip()], provider="gdelt")
-        return GdeltApiClient(query=query, max_records=max_records, lookback_minutes=lookback_minutes)
+        return GdeltApiClient(
+            query=query,
+            max_records=max_records,
+            lookback_minutes=lookback_minutes,
+            max_attempts=max_attempts,
+            backoff_base_sec=backoff_base_sec,
+            backoff_cap_sec=backoff_cap_sec,
+        )
 
     raise ValueError(f"Unsupported source: {source}")
 
@@ -317,7 +430,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Near-real-time news producer -> Kafka")
     parser.add_argument("--kafka-bootstrap", default=os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
     parser.add_argument("--topic", default=os.environ.get("RAW_ARTICLES_TOPIC", "raw_news_articles"))
-    parser.add_argument("--poll-seconds", type=int, default=int(os.environ.get("POLL_SECONDS", "60")))
+    parser.add_argument("--poll-seconds", type=int, default=int(os.environ.get("POLL_SECONDS", "300")))
     parser.add_argument("--source", choices=["newsapi", "rss", "gdelt"], default=os.environ.get("SOURCE_TYPE", "gdelt"))
     parser.add_argument("--run-once", action="store_true", help="Run one poll iteration and exit")
     parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
