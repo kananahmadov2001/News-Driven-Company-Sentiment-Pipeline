@@ -1,82 +1,116 @@
-# CSE 5114 Final Project
+# CSE 5114 Final Project: Real-Time Company News Sentiment Pipeline
 
-News-driven company sentiment pipeline on **Kafka + Spark Structured Streaming + Snowflake**.
+## Problem statement
+This project ingests financial-news events in near real time, detects company mentions, scores article sentiment, and publishes Snowflake reporting objects for dashboard analysis.
 
-This repo is optimized for LinuxLab 8-hour sessions with a 3-terminal workflow:
-1. Kafka broker terminal
-2. Spark streaming processor terminal
-3. GDELT backfill/live producer terminal
+## High-level architecture
+1. **Producer** (`streaming/producer/gdelt_backfill.py`, `streaming/producer/news_producer.py`) pulls GDELT data (with optional NewsAPI mode) and publishes JSON events to Kafka topic `raw_news_articles`.
+2. **Spark Structured Streaming** (`streaming/processor/spark_news_stream.py`) consumes Kafka events, normalizes data, performs alias-based company matching, computes VADER sentiment, and writes micro-batches to Snowflake with:
+   - `quote_identifiers=False`
+   - `use_logical_type=True`
+3. **Snowflake dynamic tables** (`snowflake/09_create_unified_realtime_reporting.sql`) build unified and dashboard-ready reporting objects.
+4. **Snowsight dashboard tiles** query `rpt_*` dynamic tables (`snowflake/dashboard_tiles/`).
 
-The proven ingestion path remains unchanged:
-- Kafka from `/opt/kafka`
-- Spark from `/opt/spark`
-- Spark submit with package `org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1`
-- Spark `foreachBatch` writes to Snowflake via Python connector
-- `write_pandas(..., quote_identifiers=False, use_logical_type=True)`
+## Active repository structure
+- `streaming/processor/` – Spark streaming application.
+- `streaming/producer/` – GDELT backfill/live producer and optional NewsAPI producer mode.
+- `streaming/scripts/` – LinuxLab Kafka start/check and Spark checkpoint reset helpers.
+- `streaming/sql/01_create_realtime_tables.sql` – realtime sink table setup for Spark writes.
+- `snowflake/01_setup_schema_objects.sql` – base schema/tables/views.
+- `snowflake/02_seed_companies_and_aliases.sql` – company seed data.
+- `snowflake/02b_expand_companies.sql` – optional company/alias expansion.
+- `snowflake/08_create_realtime_base_objects.sql` – canonical realtime base table/view.
+- `snowflake/09_create_unified_realtime_reporting.sql` – unified + dashboard dynamic tables.
+- `snowflake/dashboard_setup/` – dashboard-oriented dynamic-table refresh/check helpers.
+- `snowflake/dashboard_tiles/` – Snowsight tile SQL.
+- `snowflake/tests/pr1_realtime_base_smoke.sql` and `snowflake/tests/pr2_unified_reporting_smoke.sql` – smoke validation SQL.
 
-## Architecture (durable + restart-safe)
+## Prerequisites
 
-### Durable base writes (from Spark)
-Spark appends matched article/company rows into:
-- `article_company_match` (legacy-compatible stream sink)
-- `article_company_match_base` (canonical append-only base)
-- `mart_company_sentiment_minute` (legacy-compatible minute sink)
+### Snowflake prerequisites
+- Access to a Snowflake account with permission to use/create:
+  - role (example: `TRAINING_ROLE`)
+  - warehouse (example: `MONKEY_WH`)
+  - database (example: `MONKEY_DB`)
+  - schema `FINAL_PROJECT`
+- Key-pair auth material for Snowflake Python connector.
+- Ability to run SQL scripts in Snowsight worksheets.
 
-If LinuxLab stops, rows already committed in Snowflake remain durable.
+### LinuxLab prerequisites
+- Start LinuxLab compute session using class flow (example shown below uses `server-airflow25 -c 4`).
+- Kafka installed at `/opt/kafka`.
+- Spark installed at `/opt/spark`.
+- 3 terminals available for Kafka, Spark, and producer.
 
-### Snowflake downstream (automatic refresh)
-Run once:
-- `snowflake/08_create_realtime_base_objects.sql`
-- `snowflake/09_create_unified_realtime_reporting.sql`
+### Python prerequisites
+- Python 3.12 compatible virtual environment.
+- Install pinned dependencies from `streaming/requirements.txt`.
 
-This creates dynamic tables that auto-refresh dashboard-facing objects:
-- `dt_realtime_article_company_match` (dedup realtime base)
-- `dt_unified_article_company_mentions` (legacy NewsAPI + realtime GDELT/NewsAPI unified)
-- `rpt_company_article_volume`
-- `rpt_company_sentiment_summary`
-- `rpt_daily_trend`
-- `rpt_sentiment_examples`
-- `rpt_top_sources`
+## Fresh setup from scratch
 
-In Snowsight, you only refresh dashboards/tiles (not transformation SQL each session).
+### 1) Clone and enter repository
+```bash
+git clone https://github.com/KennyRao/cse5114_final_project.git
+cd cse5114_final_project
+```
 
-## Sentiment model choice
-
-Implemented sentiment in Spark uses **VADER** (`vaderSentiment`):
-- Better than tiny keyword baseline (continuous compound scores, negation/intensity handling)
-- Lightweight, CPU-friendly for LinuxLab streaming micro-batches
-- No paid external API and no large model downloads
-
-## LinuxLab setup
-
+### 2) Start LinuxLab session and Python environment
 ```bash
 server-airflow25 -c 4
-cd /home/compute/$USER/projects/cse5114_final_project
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r streaming/requirements.txt
-cp streaming/env.linuxlab.example.sh env.linuxlab.sh
-source env.linuxlab.sh
 ```
 
-Set Spark standalone master URL each session:
+### 3) Configure environment file
 ```bash
+cp streaming/env.linuxlab.example.sh env.linuxlab.sh
+```
+Edit `env.linuxlab.sh` and set your real Snowflake values:
+- `SNOWFLAKE_ACCOUNT`
+- `SNOWFLAKE_USER`
+- `SNOWFLAKE_DATABASE`
+- `SNOWFLAKE_SCHEMA`
+- `SNOWFLAKE_WAREHOUSE`
+- `SNOWFLAKE_ROLE`
+- `SNOWFLAKE_PRIVATE_KEY_FILE`
+- optional `SNOWFLAKE_PRIVATE_KEY_PWD`
+
+Then load env vars:
+```bash
+source env.linuxlab.sh
 export SPARK_MASTER_URL="spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}"
 ```
 
-## 3-terminal run model
+### 4) Prepare Snowflake objects (run in order)
+Run these scripts in Snowsight worksheets:
+1. `snowflake/01_setup_schema_objects.sql`
+2. `snowflake/02_seed_companies_and_aliases.sql`
+3. `snowflake/02b_expand_companies.sql` (optional)
+4. `streaming/sql/01_create_realtime_tables.sql`
+5. `snowflake/08_create_realtime_base_objects.sql`
+6. `snowflake/09_create_unified_realtime_reporting.sql`
+
+### 5) Optional validation after setup
+Run:
+- `snowflake/tests/pr1_realtime_base_smoke.sql`
+- `snowflake/tests/pr2_unified_reporting_smoke.sql`
+
+## Run the current pipeline (3 terminals)
 
 ### Terminal 1: Kafka
 ```bash
+cd ~/projects/cse5114_final_project
 source env.linuxlab.sh
 bash streaming/scripts/check_kafka_linuxlab.sh
 bash streaming/scripts/start_kafka_linuxlab.sh
 bash streaming/scripts/check_kafka_linuxlab.sh
 ```
 
-### Terminal 2: Spark streaming processor
+### Terminal 2: Spark Structured Streaming
 ```bash
+cd ~/projects/cse5114_final_project
 source .venv/bin/activate
 source env.linuxlab.sh
 
@@ -86,48 +120,85 @@ spark-submit \
   streaming/processor/spark_news_stream.py
 ```
 
-### Terminal 3: Producer (backfill then live)
-Backfill (resumable cursor + safe retries/backoff):
+### Terminal 3: Ingestion / backfill
+Backfill first (resumable):
 ```bash
+cd ~/projects/cse5114_final_project
 source .venv/bin/activate
 source env.linuxlab.sh
 python streaming/producer/gdelt_backfill.py --days-back 14 --window-hours 6 --max-events 100000
 ```
 
-Live GDELT:
+Then run live ingestion:
 ```bash
 python streaming/producer/news_producer.py --source gdelt --poll-seconds 60
 ```
 
-Optional NewsAPI mode still works:
+Optional source mode:
 ```bash
 python streaming/producer/news_producer.py --source newsapi --poll-seconds 60
 ```
 
-## Safe restart / recovery
+## Dashboard and reporting instructions
 
-- If Spark stops, restart Terminal 2. Checkpointing resumes stream progress.
-- If backfill stops, rerun `gdelt_backfill.py`; it resumes from cursor file (`BACKFILL_CURSOR_FILE`).
-- Snowflake data already written remains available; dynamic tables continue to refresh from durable base objects.
+### Reporting lineage
+- Spark writes base sink rows to:
+  - `ARTICLE_COMPANY_MATCH`
+  - `ARTICLE_COMPANY_MATCH_BASE`
+  - `MART_COMPANY_SENTIMENT_MINUTE`
+- Snowflake dynamic table layer builds:
+  - `DT_REALTIME_ARTICLE_COMPANY_MATCH`
+  - `DT_UNIFIED_ARTICLE_COMPANY_MENTIONS`
+  - `RPT_*` dashboard objects
 
-## Verification queries
+### Dynamic table refresh behavior
+- Dynamic tables are configured with `TARGET_LAG = '5 minutes'` and refresh automatically.
+- If you need immediate refresh before grading/demo, run `snowflake/dashboard_setup/01c_start_task_manually.sql`.
+- To verify refresh status/history, run `snowflake/dashboard_setup/01d_check_task.sql`.
 
-```sql
-SELECT COUNT(*) FROM FINAL_PROJECT.article_company_match_base;
-SELECT provider, COUNT(*) FROM FINAL_PROJECT.dt_unified_article_company_mentions GROUP BY 1;
-SELECT * FROM FINAL_PROJECT.rpt_company_article_volume ORDER BY article_count DESC;
-SELECT * FROM FINAL_PROJECT.rpt_company_sentiment_summary ORDER BY scored_articles DESC;
-SELECT * FROM FINAL_PROJECT.rpt_daily_trend ORDER BY metric_date DESC;
-```
+### Snowsight dashboard refresh
+- Open the dashboard that uses SQL in `snowflake/dashboard_tiles/`.
+- Refresh tiles/dashboard in Snowsight after new data arrives.
 
-## What remains preserved between sessions
+## Current active Snowflake objects
 
-- All Snowflake base and reporting data
-- Dynamic table definitions + refresh behavior
-- Backfill cursor checkpoint file (if same LinuxLab filesystem path)
+### Database and schema
+- `MONKEY_DB.FINAL_PROJECT`
 
-## Notes
+### Base/dimension tables used now
+- `DIM_COMPANIES` – tracked companies.
+- `DIM_COMPANY_ALIASES` – alias lookup for mention matching.
+- `RAW_ARTICLES` – historical/legacy article store used by unified layer.
+- `FACT_ARTICLE_COMPANY_MENTIONS` – historical/legacy mention facts used by unified layer.
+- `FACT_ARTICLE_SENTIMENT` – historical/legacy sentiment facts used by unified layer.
+- `ARTICLE_COMPANY_MATCH` – compatibility sink from Spark.
+- `ARTICLE_COMPANY_MATCH_BASE` – canonical append-only realtime sink from Spark.
+- `MART_COMPANY_SENTIMENT_MINUTE` – compatibility minute aggregate sink from Spark.
 
-- Do not remove or alter the working Snowflake connector write settings.
-- Do not replace Kafka + Spark + Snowflake architecture.
-- GDELT remains the primary practical source; NewsAPI is optional compatibility path.
+### Dynamic tables used now
+- `DT_REALTIME_ARTICLE_COMPANY_MATCH` – deduplicated realtime canonical rows.
+- `DT_UNIFIED_ARTICLE_COMPANY_MENTIONS` – unified legacy + realtime reporting grain.
+- `RPT_COMPANY_ARTICLE_VOLUME` – dashboard article volume by company.
+- `RPT_COMPANY_SENTIMENT_SUMMARY` – dashboard sentiment summary by company.
+- `RPT_DAILY_TREND` – dashboard time-series trend.
+- `RPT_SENTIMENT_EXAMPLES` – dashboard sample rows.
+- `RPT_TOP_SOURCES` – dashboard source distribution.
+
+### Views used now
+- `VW_LEGACY_ARTICLE_COMPANY_MENTIONS` – legacy compatibility feed for unified DT.
+- `VW_REALTIME_ARTICLE_COMPANY_MENTIONS` – convenience view on realtime DT.
+- `VW_UNIFIED_ARTICLE_COMPANY_MENTIONS` – convenience view on unified DT.
+- `V_ARTICLE_COMPANY_MATCH_BASE_DUPS` – duplicate visibility helper for canonical key checks.
+
+## Data source notes
+- **Primary current source**: GDELT (`gdelt_backfill.py` and `news_producer.py --source gdelt`).
+- **Optional source**: NewsAPI mode (`news_producer.py --source newsapi`) if credentials are available.
+
+## Reproducibility and troubleshooting
+- If Spark stops, restart Terminal 2; checkpoint path (`CHECKPOINT_PATH`) preserves progress.
+- If backfill stops, rerun `gdelt_backfill.py`; cursor resumes from `BACKFILL_CURSOR_FILE`.
+- If Kafka is not reachable, rerun:
+  - `bash streaming/scripts/check_kafka_linuxlab.sh`
+  - `bash streaming/scripts/start_kafka_linuxlab.sh`
+- If Snowflake writes fail, verify env vars and key file path in `env.linuxlab.sh`.
+- If dashboard tables look stale, run manual refresh SQL in `snowflake/dashboard_setup/01c_start_task_manually.sql` and then refresh Snowsight tiles.
