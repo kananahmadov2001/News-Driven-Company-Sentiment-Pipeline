@@ -107,6 +107,7 @@ bash streaming/scripts/check_kafka_linuxlab.sh
 bash streaming/scripts/start_kafka_linuxlab.sh
 bash streaming/scripts/check_kafka_linuxlab.sh
 ```
+`start_kafka_linuxlab.sh` is idempotent: it starts Kafka only when needed and always ensures topic `${RAW_ARTICLES_TOPIC:-raw_news_articles}` exists.
 
 ### Terminal 2: Spark Structured Streaming
 ```bash
