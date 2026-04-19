@@ -4,23 +4,27 @@ Pipeline stages:
 1. Read raw article events from Kafka topic raw_news_articles.
 2. Clean/normalize fields and deduplicate by URL hash.
 3. Perform company matching using alias dimension loaded from Snowflake.
-4. Compute sentiment score.
-5. Upsert article-level and aggregate results into Snowflake.
+4. Compute sentiment score with VADER (rule-based, robust for headlines).
+5. Append batch outputs into Snowflake base and compatibility tables.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import Optional
+
 import pandas as pd
 import snowflake.connector
 from snowflake.connector.pandas_tools import write_pandas
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import StringType, StructField, StructType
+from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 
 
 LOGGER = logging.getLogger("spark_news_stream")
+_SENTIMENT_ANALYZER: Optional[SentimentIntensityAnalyzer] = None
 
 
 RAW_ARTICLE_SCHEMA = StructType(
@@ -87,7 +91,7 @@ def parse_and_normalize(raw_df: DataFrame) -> DataFrame:
         .withColumn("url_hash", F.sha2(F.lower(F.trim(F.col("url"))), 256))
         .withColumn(
             "article_text",
-            F.concat_ws(" ", F.coalesce("title", F.lit("")), F.coalesce("description", F.lit("")), F.coalesce("content", F.lit(""))),
+            F.trim(F.concat_ws(" ", F.coalesce("title", F.lit("")), F.coalesce("description", F.lit("")), F.coalesce("content", F.lit("")))),
         )
         .dropna(subset=["url", "title"])
         .dropDuplicates(["url_hash"])
@@ -95,16 +99,25 @@ def parse_and_normalize(raw_df: DataFrame) -> DataFrame:
     return normalized
 
 
-def add_rule_sentiment(df: DataFrame) -> DataFrame:
-    positive_words = ["beat", "surge", "growth", "upgraded", "profit", "rally"]
-    negative_words = ["miss", "plunge", "layoff", "downgrade", "loss", "lawsuit"]
+def _vader_compound(text: Optional[str]) -> float:
+    global _SENTIMENT_ANALYZER
+    if _SENTIMENT_ANALYZER is None:
+        _SENTIMENT_ANALYZER = SentimentIntensityAnalyzer()
+    if not text:
+        return 0.0
+    return float(_SENTIMENT_ANALYZER.polarity_scores(text).get("compound", 0.0))
 
-    positive_score = sum(F.when(F.lower(F.col("article_text")).contains(w), F.lit(1)).otherwise(F.lit(0)) for w in positive_words)
-    negative_score = sum(F.when(F.lower(F.col("article_text")).contains(w), F.lit(1)).otherwise(F.lit(0)) for w in negative_words)
 
+def add_vader_sentiment(df: DataFrame) -> DataFrame:
+    sentiment_udf = F.udf(_vader_compound, DoubleType())
     return (
-        df.withColumn("sentiment_raw", positive_score - negative_score)
-        .withColumn("sentiment_score", F.when(F.col("sentiment_raw") > 0, F.lit(1.0)).when(F.col("sentiment_raw") < 0, F.lit(-1.0)).otherwise(F.lit(0.0)))
+        df.withColumn("sentiment_score", sentiment_udf(F.col("article_text")))
+        .withColumn(
+            "sentiment_label",
+            F.when(F.col("sentiment_score") >= F.lit(0.05), F.lit("positive"))
+            .when(F.col("sentiment_score") <= F.lit(-0.05), F.lit("negative"))
+            .otherwise(F.lit("neutral")),
+        )
     )
 
 
@@ -128,7 +141,20 @@ def match_companies(df: DataFrame, aliases: DataFrame) -> DataFrame:
     return (
         df.crossJoin(F.broadcast(aliases))
         .where(F.instr(F.lower(F.col("article_text")), F.col("alias_norm")) > 0)
-        .select("event_id", "url_hash", "published_at_ts", "company_id", "sentiment_score", "source_name")
+        .select(
+            "event_id",
+            "provider",
+            "provider_article_id",
+            "url",
+            "url_hash",
+            "published_at_ts",
+            "event_ingested_at_ts",
+            "company_id",
+            "sentiment_score",
+            "sentiment_label",
+            "source_name",
+            "article_text",
+        )
     )
 
 
@@ -150,6 +176,26 @@ def write_batch_to_snowflake(batch_df: DataFrame, batch_id: int) -> None:
         .toPandas()
     )
 
+    base_pdf = (
+        batch_df.select(
+            "event_id",
+            "provider",
+            "provider_article_id",
+            "url",
+            "url_hash",
+            "published_at_ts",
+            "event_ingested_at_ts",
+            "company_id",
+            "sentiment_score",
+            "source_name",
+            "article_text",
+        )
+        .dropDuplicates(["event_id", "company_id"])
+        .toPandas()
+    )
+    if not base_pdf.empty:
+        base_pdf["ingest_batch_id"] = str(batch_id)
+
     minute_pdf = (
         batch_df.withColumn("bucket_minute", F.date_trunc("minute", F.col("published_at_ts")))
         .groupBy("bucket_minute", "company_id")
@@ -167,6 +213,17 @@ def write_batch_to_snowflake(batch_df: DataFrame, batch_id: int) -> None:
                 conn,
                 article_pdf,
                 os.environ.get("ARTICLE_MATCH_TABLE", "article_company_match"),
+                auto_create_table=False,
+                overwrite=False,
+                quote_identifiers=False,
+                use_logical_type=True,
+            )
+
+        if not base_pdf.empty:
+            write_pandas(
+                conn,
+                base_pdf,
+                os.environ.get("ARTICLE_MATCH_BASE_TABLE", "article_company_match_base"),
                 auto_create_table=False,
                 overwrite=False,
                 quote_identifiers=False,
@@ -196,7 +253,7 @@ def main() -> None:
     spark = build_spark()
     raw = load_kafka_stream(spark)
     normalized = parse_and_normalize(raw)
-    scored = add_rule_sentiment(normalized)
+    scored = add_vader_sentiment(normalized)
     aliases = load_company_aliases(spark)
     matched = match_companies(scored, aliases)
 

@@ -2,122 +2,80 @@
 
 News-driven company sentiment pipeline on **Kafka + Spark Structured Streaming + Snowflake**.
 
-This repository supports three practical demo paths on WashU LinuxLab:
-1. **Synthetic smoke test** (publish exactly one event with Python)
-2. **Live near-real-time ingestion** (GDELT-first)
-3. **Historical backfill** (GDELT one-shot -> Kafka -> Spark -> Snowflake)
+This repo is optimized for LinuxLab 8-hour sessions with a 3-terminal workflow:
+1. Kafka broker terminal
+2. Spark streaming processor terminal
+3. GDELT backfill/live producer terminal
 
----
+The proven ingestion path remains unchanged:
+- Kafka from `/opt/kafka`
+- Spark from `/opt/spark`
+- Spark submit with package `org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1`
+- Spark `foreachBatch` writes to Snowflake via Python connector
+- `write_pandas(..., quote_identifiers=False, use_logical_type=True)`
 
-## 1) LinuxLab assumptions (current working path)
+## Architecture (durable + restart-safe)
 
-- Start each LinuxLab session with:
-  ```bash
-  server-airflow25 -c 4
-  ```
-- Kafka install: `/opt/kafka`
-- Spark install: `/opt/spark`
-- Kafka config: `~/kafka-server.properties`
-- Kafka log dir: `~/kafka-local-logs`
-- Kafka bootstrap: `localhost:9092`
-- Topic: `raw_news_articles`
-- Spark package required on LinuxLab Spark 4.0.1:
-  `org.apache.spark:spark-sql-kafka-0-10_2.13:4.0.1`
+### Durable base writes (from Spark)
+Spark appends matched article/company rows into:
+- `article_company_match` (legacy-compatible stream sink)
+- `article_company_match_base` (canonical append-only base)
+- `mart_company_sentiment_minute` (legacy-compatible minute sink)
 
-> Snowflake writes in this repo use the **Snowflake Python connector** path (inside `foreachBatch`) rather than the Spark Snowflake connector. This is intentional for the working LinuxLab Spark 4.0.1 flow.
+If LinuxLab stops, rows already committed in Snowflake remain durable.
 
----
+### Snowflake downstream (automatic refresh)
+Run once:
+- `snowflake/08_create_realtime_base_objects.sql`
+- `snowflake/09_create_unified_realtime_reporting.sql`
 
-## 2) Python environment setup
+This creates dynamic tables that auto-refresh dashboard-facing objects:
+- `dt_realtime_article_company_match` (dedup realtime base)
+- `dt_unified_article_company_mentions` (legacy NewsAPI + realtime GDELT/NewsAPI unified)
+- `rpt_company_article_volume`
+- `rpt_company_sentiment_summary`
+- `rpt_daily_trend`
+- `rpt_sentiment_examples`
+- `rpt_top_sources`
+
+In Snowsight, you only refresh dashboards/tiles (not transformation SQL each session).
+
+## Sentiment model choice
+
+Implemented sentiment in Spark uses **VADER** (`vaderSentiment`):
+- Better than tiny keyword baseline (continuous compound scores, negation/intensity handling)
+- Lightweight, CPU-friendly for LinuxLab streaming micro-batches
+- No paid external API and no large model downloads
+
+## LinuxLab setup
 
 ```bash
+server-airflow25 -c 4
 cd /home/compute/$USER/projects/cse5114_final_project
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r streaming/requirements.txt
-```
-
----
-
-## 3) Environment variables (repo-local, no secrets in git)
-
-```bash
 cp streaming/env.linuxlab.example.sh env.linuxlab.sh
-# edit env.linuxlab.sh with your local values (do not commit secrets)
 source env.linuxlab.sh
 ```
 
-Required Snowflake vars for key-pair auth:
-- `SNOWFLAKE_ACCOUNT`
-- `SNOWFLAKE_USER`
-- `SNOWFLAKE_DATABASE`
-- `SNOWFLAKE_SCHEMA`
-- `SNOWFLAKE_WAREHOUSE`
-- `SNOWFLAKE_ROLE`
-- `SNOWFLAKE_AUTHENTICATOR=SNOWFLAKE_JWT`
-- `SNOWFLAKE_PRIVATE_KEY_FILE`
-
-Keep auth mode as key-pair (`SNOWFLAKE_JWT`) unless you intentionally redesign auth.
-
----
-
-## 4) Spark master URL check/set (LinuxLab)
-
-Use standalone master format:
-
+Set Spark standalone master URL each session:
 ```bash
 export SPARK_MASTER_URL="spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}"
-echo "$SPARK_MASTER_URL"
 ```
 
-If your session startup script already exports these vars, this line simply confirms alignment.
+## 3-terminal run model
 
----
-
-## 5) Kafka startup/check (safe, avoids duplicate brokers)
-
-### Create LinuxLab broker config/log dir once
-
+### Terminal 1: Kafka
 ```bash
-cat > ~/kafka-server.properties <<'EOF_CFG'
-process.roles=broker,controller
-node.id=1
-listeners=PLAINTEXT://:9092,CONTROLLER://:9093
-advertised.listeners=PLAINTEXT://localhost:9092
-controller.listener.names=CONTROLLER
-listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
-controller.quorum.voters=1@localhost:9093
-inter.broker.listener.name=PLAINTEXT
-log.dirs=/home/compute/$USER/kafka-local-logs
-num.partitions=3
-offsets.topic.replication.factor=1
-transaction.state.log.replication.factor=1
-transaction.state.log.min.isr=1
-EOF_CFG
-mkdir -p ~/kafka-local-logs
-```
-
-### Check/start sequence
-
-```bash
+source env.linuxlab.sh
 bash streaming/scripts/check_kafka_linuxlab.sh
 bash streaming/scripts/start_kafka_linuxlab.sh
 bash streaming/scripts/check_kafka_linuxlab.sh
 ```
 
-### Ensure topic exists
-
-```bash
-/opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" \
-  --create --if-not-exists --topic "$RAW_ARTICLES_TOPIC" --partitions 3 --replication-factor 1
-```
-
----
-
-## 6) Run Spark streaming processor
-
+### Terminal 2: Spark streaming processor
 ```bash
 source .venv/bin/activate
 source env.linuxlab.sh
@@ -128,103 +86,48 @@ spark-submit \
   streaming/processor/spark_news_stream.py
 ```
 
-If you intentionally want replay behavior from earliest offsets:
-
-```bash
-bash streaming/scripts/reset_checkpoint.sh
-export KAFKA_STARTING_OFFSETS=earliest
-```
-
----
-
-## 7) Smoke test producer (guaranteed demo path)
-
+### Terminal 3: Producer (backfill then live)
+Backfill (resumable cursor + safe retries/backoff):
 ```bash
 source .venv/bin/activate
 source env.linuxlab.sh
-python streaming/producer/smoke_event_producer.py
+python streaming/producer/gdelt_backfill.py --days-back 14 --window-hours 6 --max-events 100000
 ```
 
-Expected: script prints it published exactly 1 event.
-
----
-
-## 8) GDELT backfill (demo data preload)
-
+Live GDELT:
 ```bash
-source .venv/bin/activate
-source env.linuxlab.sh
-
-python streaming/producer/gdelt_backfill.py \
-  --days-back 14 \
-  --window-hours 6 \
-  --max-records 250 \
-  --max-events 5000
-```
-
-Dry run (no Kafka writes):
-
-```bash
-python streaming/producer/gdelt_backfill.py --days-back 7 --dry-run
-```
-
----
-
-## 9) Live producer (GDELT-first)
-
-```bash
-source .venv/bin/activate
-source env.linuxlab.sh
 python streaming/producer/news_producer.py --source gdelt --poll-seconds 60
 ```
 
-Optional source modes:
-- `--source newsapi` (optional, requires `NEWSAPI_API_KEY`)
-- `--source rss` (explicit feed list via `RSS_FEED_URLS`)
-
----
-
-## 10) Verify results
-
-### Kafka
-
+Optional NewsAPI mode still works:
 ```bash
-/opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server "$KAFKA_BOOTSTRAP_SERVERS" \
-  --topic "$RAW_ARTICLES_TOPIC" \
-  --from-beginning --max-messages 5
+python streaming/producer/news_producer.py --source newsapi --poll-seconds 60
 ```
 
-### Snowflake
+## Safe restart / recovery
+
+- If Spark stops, restart Terminal 2. Checkpointing resumes stream progress.
+- If backfill stops, rerun `gdelt_backfill.py`; it resumes from cursor file (`BACKFILL_CURSOR_FILE`).
+- Snowflake data already written remains available; dynamic tables continue to refresh from durable base objects.
+
+## Verification queries
 
 ```sql
-SELECT COUNT(*) AS row_count FROM FINAL_PROJECT.article_company_match;
-
-SELECT bucket_minute, company_id, article_count, avg_sentiment
-FROM FINAL_PROJECT.mart_company_sentiment_minute
-ORDER BY bucket_minute DESC
-LIMIT 20;
+SELECT COUNT(*) FROM FINAL_PROJECT.article_company_match_base;
+SELECT provider, COUNT(*) FROM FINAL_PROJECT.dt_unified_article_company_mentions GROUP BY 1;
+SELECT * FROM FINAL_PROJECT.rpt_company_article_volume ORDER BY article_count DESC;
+SELECT * FROM FINAL_PROJECT.rpt_company_sentiment_summary ORDER BY scored_articles DESC;
+SELECT * FROM FINAL_PROJECT.rpt_daily_trend ORDER BY metric_date DESC;
 ```
 
----
+## What remains preserved between sessions
 
-## 11) Presentation-day runbook
+- All Snowflake base and reporting data
+- Dynamic table definitions + refresh behavior
+- Backfill cursor checkpoint file (if same LinuxLab filesystem path)
 
-1. Start LinuxLab session: `server-airflow25 -c 4`
-2. `source env.linuxlab.sh`; confirm `SPARK_MASTER_URL`
-3. Verify/start Kafka (`check_kafka_linuxlab.sh`, then `start_kafka_linuxlab.sh` if needed)
-4. Start Spark streaming job
-5. Run smoke event producer (guarantees end-to-end demo)
-6. Verify Snowflake rows
-7. Run GDELT backfill for demo volume
-8. Optionally run live GDELT producer
+## Notes
 
----
-
-## 12) What NOT to do
-
-- Do not revert away from Snowflake Python connector writes in the streaming processor.
-- Do not remove required `write_pandas` options (`quote_identifiers=False`, `use_logical_type=True`).
-- Do not switch key-pair auth away from current working design unless intentionally redesigning.
-- Do not restore old Reuters/weak defaults as primary live path.
-- Do not commit private keys or secrets.
+- Do not remove or alter the working Snowflake connector write settings.
+- Do not replace Kafka + Spark + Snowflake architecture.
+- GDELT remains the primary practical source; NewsAPI is optional compatibility path.

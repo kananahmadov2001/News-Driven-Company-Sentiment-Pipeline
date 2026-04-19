@@ -3,4 +3,5 @@ USE WAREHOUSE MONKEY_WH;
 USE DATABASE MONKEY_DB;
 USE SCHEMA FINAL_PROJECT;
 
-ALTER TASK task_refresh_dashboard_tables_10m RESUME;
+-- No scheduled task required; dynamic tables refresh automatically.
+SELECT 'No-op: dynamic tables auto-refresh. Use ALTER DYNAMIC TABLE ... REFRESH for manual run.' AS info;

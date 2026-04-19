@@ -3,4 +3,8 @@ USE WAREHOUSE MONKEY_WH;
 USE DATABASE MONKEY_DB;
 USE SCHEMA FINAL_PROJECT;
 
-EXECUTE TASK task_refresh_dashboard_tables_10m;
+ALTER DYNAMIC TABLE rpt_company_article_volume REFRESH;
+ALTER DYNAMIC TABLE rpt_company_sentiment_summary REFRESH;
+ALTER DYNAMIC TABLE rpt_daily_trend REFRESH;
+ALTER DYNAMIC TABLE rpt_sentiment_examples REFRESH;
+ALTER DYNAMIC TABLE rpt_top_sources REFRESH;

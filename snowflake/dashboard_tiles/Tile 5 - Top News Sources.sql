@@ -4,9 +4,9 @@ USE DATABASE MONKEY_DB;
 USE SCHEMA FINAL_PROJECT;
 
 SELECT
-    COALESCE(source_name, 'UNKNOWN') AS source_name,
-    COUNT(*) AS article_count
-FROM raw_articles
-GROUP BY 1
+    source_name,
+    article_count,
+    refreshed_at
+FROM rpt_top_sources
 ORDER BY article_count DESC
 LIMIT 15;
