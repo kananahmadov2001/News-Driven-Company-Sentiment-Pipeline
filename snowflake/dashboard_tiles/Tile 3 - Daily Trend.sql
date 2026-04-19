@@ -9,4 +9,5 @@ SELECT
     avg_sentiment_across_companies,
     refreshed_at
 FROM rpt_daily_trend
+WHERE metric_date >= DATEADD(day, -30, CURRENT_DATE())
 ORDER BY metric_date ASC;
