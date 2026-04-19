@@ -194,10 +194,13 @@ python streaming/producer/news_producer.py --source newsapi --poll-seconds 60
 ## Data source notes
 - **Primary current source**: GDELT (`gdelt_backfill.py` and `news_producer.py --source gdelt`).
 - **Optional source**: NewsAPI mode (`news_producer.py --source newsapi`) if credentials are available.
+- LinuxLab defaults are tuned for unattended sessions: slower poll cadence (`POLL_SECONDS=300`), bounded live retry/backoff, and backfill skip-and-continue behavior with failed-window logging.
 
 ## Reproducibility and troubleshooting
 - If Spark stops, restart Terminal 2; checkpoint path (`CHECKPOINT_PATH`) preserves progress.
 - If backfill stops, rerun `gdelt_backfill.py`; cursor resumes from `BACKFILL_CURSOR_FILE`.
+- Backfill failed/skipped windows are logged to `BACKFILL_FAILED_WINDOWS_FILE` (JSONL) so they can be inspected and replayed later.
+- Live GDELT polling now applies retry/backoff plus cooldown (`GDELT_FAILURE_COOLDOWN_BASE_SEC`, `GDELT_FAILURE_COOLDOWN_CAP_SEC`) after repeated failures to reduce 429 bursts.
 - If Kafka is not reachable, rerun:
   - `bash streaming/scripts/check_kafka_linuxlab.sh`
   - `bash streaming/scripts/start_kafka_linuxlab.sh`

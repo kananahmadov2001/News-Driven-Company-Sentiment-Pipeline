@@ -20,6 +20,7 @@ from typing import Dict, Iterable, List, Optional
 from urllib.parse import quote_plus
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from json import JSONDecodeError
 
 from kafka import KafkaProducer
 
@@ -178,6 +179,8 @@ class GdeltApiClient(SourceClient):
         max_attempts: int = 6,
         backoff_base_sec: float = 5.0,
         backoff_cap_sec: float = 120.0,
+        failure_cooldown_base_sec: float = 60.0,
+        failure_cooldown_cap_sec: float = 900.0,
     ):
         self.query = query
         self.max_records = max_records
@@ -185,6 +188,9 @@ class GdeltApiClient(SourceClient):
         self.max_attempts = max(1, max_attempts)
         self.backoff_base_sec = max(0.1, backoff_base_sec)
         self.backoff_cap_sec = max(self.backoff_base_sec, backoff_cap_sec)
+        self.failure_cooldown_base_sec = max(1.0, failure_cooldown_base_sec)
+        self.failure_cooldown_cap_sec = max(self.failure_cooldown_base_sec, failure_cooldown_cap_sec)
+        self.consecutive_fetch_failures = 0
 
     def _build_url(self) -> str:
         encoded_query = quote_plus(self.query)
@@ -199,8 +205,18 @@ class GdeltApiClient(SourceClient):
             base_sleep = min(self.backoff_cap_sec, retry_after)
         else:
             base_sleep = min(self.backoff_cap_sec, self.backoff_base_sec * (2 ** max(0, attempt - 1)))
-        jitter = random.uniform(0, min(1.0, base_sleep * 0.2))
+        jitter = random.uniform(0, min(1.0, max(0.5, base_sleep * 0.2)))
         return min(self.backoff_cap_sec, base_sleep + jitter)
+
+    def _compute_failure_cooldown(self) -> float:
+        if self.consecutive_fetch_failures <= 0:
+            return 0.0
+        base = min(
+            self.failure_cooldown_cap_sec,
+            self.failure_cooldown_base_sec * (2 ** max(0, self.consecutive_fetch_failures - 1)),
+        )
+        jitter = random.uniform(0, min(10.0, max(1.0, base * 0.25)))
+        return min(self.failure_cooldown_cap_sec, base + jitter)
 
     def _parse_retry_after(self, header_value: Optional[str]) -> Optional[float]:
         if not header_value:
@@ -225,19 +241,23 @@ class GdeltApiClient(SourceClient):
             self._build_url(),
             headers={
                 "User-Agent": "cse5114-final-project-news-producer/1.0 (+https://github.com/KennyRao/cse5114_final_project)",
-                "Accept": "application/json",
+                "Accept": "application/json,text/plain,*/*",
             },
         )
         with urlopen(req, timeout=30) as response:
-            body = response.read().decode("utf-8", errors="replace")
-        if not body.strip():
+            body_bytes = response.read()
+
+        if not body_bytes:
             raise ValueError("GDELT returned empty response body")
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"GDELT returned malformed JSON: {exc}") from exc
+
+        body = body_bytes.decode("utf-8", errors="replace").strip()
+        if not body:
+            raise ValueError("GDELT returned blank response body")
+
+        payload = json.loads(body)
         if not isinstance(payload, dict):
             raise ValueError(f"GDELT returned unexpected JSON payload type: {type(payload).__name__}")
+
         articles = payload.get("articles")
         if articles is None:
             payload["articles"] = []
@@ -253,6 +273,7 @@ class GdeltApiClient(SourceClient):
         for attempt in range(1, self.max_attempts + 1):
             retry_after: Optional[float] = None
             should_retry = False
+            reason = "unknown"
             try:
                 payload = self._request_payload()
                 break
@@ -267,27 +288,40 @@ class GdeltApiClient(SourceClient):
                 last_error = exc
                 should_retry = True
                 reason = f"URLError ({exc.reason})"
-            except ValueError as exc:
+            except (JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
                 last_error = exc
                 should_retry = True
                 reason = str(exc)
 
-            if not should_retry:
+            if not should_retry or attempt >= self.max_attempts:
                 break
-            if attempt >= self.max_attempts:
-                break
+
             sleep_sec = self._compute_backoff_sleep(attempt, retry_after=retry_after)
             LOGGER.warning(
-                "GDELT fetch retry attempt=%s/%s reason=%s sleep_sec=%.2f",
+                "GDELT fetch retry attempt=%s/%s reason=%s retry_after=%s sleep_sec=%.2f",
                 attempt,
                 self.max_attempts,
                 reason,
+                retry_after,
                 sleep_sec,
             )
             time.sleep(sleep_sec)
 
         if payload is None:
+            self.consecutive_fetch_failures += 1
+            cooldown = self._compute_failure_cooldown()
+            LOGGER.warning(
+                "GDELT fetch exhausted retries; consecutive_failures=%s cooldown_sec=%.2f",
+                self.consecutive_fetch_failures,
+                cooldown,
+            )
+            if cooldown > 0:
+                time.sleep(cooldown)
             raise RuntimeError(f"GDELT fetch failed after {self.max_attempts} attempts: {last_error}") from last_error
+
+        if self.consecutive_fetch_failures:
+            LOGGER.info("GDELT fetch recovered after consecutive_failures=%s", self.consecutive_fetch_failures)
+        self.consecutive_fetch_failures = 0
 
         for row in payload.get("articles", []):
             article_url = row.get("url")
@@ -408,6 +442,8 @@ def build_source_from_env(source: str) -> SourceClient:
         max_attempts = int(os.environ.get("GDELT_MAX_ATTEMPTS", "6"))
         backoff_base_sec = float(os.environ.get("GDELT_BACKOFF_BASE_SEC", "5"))
         backoff_cap_sec = float(os.environ.get("GDELT_BACKOFF_CAP_SEC", "120"))
+        failure_cooldown_base_sec = float(os.environ.get("GDELT_FAILURE_COOLDOWN_BASE_SEC", "60"))
+        failure_cooldown_cap_sec = float(os.environ.get("GDELT_FAILURE_COOLDOWN_CAP_SEC", "900"))
         gdelt_mode = os.environ.get("GDELT_MODE", "docapi").lower()
         if gdelt_mode == "rssarchive":
             urls = os.environ.get("GDELT_RSS_FEED_URLS", "").strip()
@@ -421,6 +457,8 @@ def build_source_from_env(source: str) -> SourceClient:
             max_attempts=max_attempts,
             backoff_base_sec=backoff_base_sec,
             backoff_cap_sec=backoff_cap_sec,
+            failure_cooldown_base_sec=failure_cooldown_base_sec,
+            failure_cooldown_cap_sec=failure_cooldown_cap_sec,
         )
 
     raise ValueError(f"Unsupported source: {source}")
