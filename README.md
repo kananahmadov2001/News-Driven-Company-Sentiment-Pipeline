@@ -198,6 +198,7 @@ python streaming/producer/news_producer.py --source newsapi --poll-seconds 60
 ## Reproducibility and troubleshooting
 - If Spark stops, restart Terminal 2; checkpoint path (`CHECKPOINT_PATH`) preserves progress.
 - If backfill stops, rerun `gdelt_backfill.py`; cursor resumes from `BACKFILL_CURSOR_FILE`.
+- Backfill failed/skipped windows are logged to `BACKFILL_FAILED_WINDOWS_FILE` (JSONL) so they can be inspected and replayed later.
 - If Kafka is not reachable, rerun:
   - `bash streaming/scripts/check_kafka_linuxlab.sh`
   - `bash streaming/scripts/start_kafka_linuxlab.sh`

@@ -14,6 +14,7 @@ import logging
 import os
 import random
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,24 @@ from kafka import KafkaProducer
 
 
 LOGGER = logging.getLogger("gdelt_backfill")
+
+
+class GdeltBackfillError(RuntimeError):
+    """Base class for backfill fetch failures."""
+
+
+class GdeltNonRetryableError(GdeltBackfillError):
+    """Failure that should not be retried (e.g. hard 4xx)."""
+
+
+class GdeltRetryExhaustedError(GdeltBackfillError):
+    """Failure after max retry attempts."""
+
+
+@dataclass
+class WindowResult:
+    articles: list[dict]
+    attempts: int
 
 
 def dt_to_gdelt(value: datetime) -> str:
@@ -69,8 +88,13 @@ def build_event(article: dict) -> dict | None:
 def _parse_retry_after(header_value: Optional[str]) -> Optional[float]:
     if not header_value:
         return None
+
+    value = header_value.strip()
+    if not value:
+        return None
+
     try:
-        return max(0.0, float(header_value))
+        return max(0.0, float(value))
     except ValueError:
         return None
 
@@ -86,6 +110,28 @@ def _compute_sleep_s(
     return min(backoff_cap_sec, backoff_base_sec * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
 
 
+def _parse_articles_payload(body_bytes: bytes) -> list[dict]:
+    if not body_bytes:
+        raise ValueError("Empty response body from GDELT")
+
+    body_text = body_bytes.decode("utf-8", errors="replace").strip()
+    if not body_text:
+        raise ValueError("Blank response body from GDELT")
+
+    payload = json.loads(body_text)
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unexpected non-object JSON payload type: {type(payload).__name__}")
+
+    articles = payload.get("articles", [])
+    if articles is None:
+        return []
+    if not isinstance(articles, list):
+        raise ValueError(f"Unexpected 'articles' type: {type(articles).__name__}")
+
+    return articles
+
+
 def fetch_window_with_retry(
     query: str,
     start_utc: datetime,
@@ -94,13 +140,15 @@ def fetch_window_with_retry(
     max_attempts: int,
     backoff_base_sec: float,
     backoff_cap_sec: float,
-) -> list[dict]:
+) -> WindowResult:
     encoded = quote_plus(query)
     url = (
         "https://api.gdeltproject.org/api/v2/doc/doc"
         f"?query={encoded}&mode=ArtList&format=json&maxrecords={max_records}&sort=datedesc"
         f"&startdatetime={dt_to_gdelt(start_utc)}&enddatetime={dt_to_gdelt(end_utc)}"
     )
+
+    last_error: Optional[Exception] = None
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -115,28 +163,17 @@ def fetch_window_with_retry(
             with urlopen(req, timeout=45) as response:
                 body_bytes = response.read()
 
-            if not body_bytes:
-                raise ValueError("Empty response body from GDELT")
-
-            body_text = body_bytes.decode("utf-8", errors="replace").strip()
-            if not body_text:
-                raise ValueError("Blank response body from GDELT")
-
-            payload = json.loads(body_text)
-
-            if not isinstance(payload, dict):
-                raise ValueError(f"Unexpected non-object JSON payload type: {type(payload).__name__}")
-
-            articles = payload.get("articles", [])
-            if articles is None:
-                return []
-            if not isinstance(articles, list):
-                raise ValueError(f"Unexpected 'articles' type: {type(articles).__name__}")
-
-            return articles
+            return WindowResult(
+                articles=_parse_articles_payload(body_bytes),
+                attempts=attempt,
+            )
 
         except HTTPError as exc:
-            retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
+            last_error = exc
+            if not (exc.code == 429 or 500 <= exc.code < 600):
+                raise GdeltNonRetryableError(f"HTTP error {exc.code} for GDELT window") from exc
+
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After")) if exc.headers else None
             sleep_s = _compute_sleep_s(
                 attempt,
                 backoff_base_sec,
@@ -145,24 +182,26 @@ def fetch_window_with_retry(
             )
 
             if attempt >= max_attempts:
-                raise
+                break
 
             LOGGER.warning(
-                "HTTP error for window %s..%s (attempt %s/%s code=%s), sleeping %.2fs",
+                "HTTP error for window %s..%s (attempt %s/%s code=%s retry_after=%s), sleeping %.2fs",
                 start_utc.isoformat(),
                 end_utc.isoformat(),
                 attempt,
                 max_attempts,
                 exc.code,
+                retry_after,
                 sleep_s,
             )
             time.sleep(sleep_s)
 
         except URLError as exc:
+            last_error = exc
             sleep_s = _compute_sleep_s(attempt, backoff_base_sec, backoff_cap_sec)
 
             if attempt >= max_attempts:
-                raise
+                break
 
             LOGGER.warning(
                 "Network error for window %s..%s (attempt %s/%s err=%s), sleeping %.2fs",
@@ -176,10 +215,11 @@ def fetch_window_with_retry(
             time.sleep(sleep_s)
 
         except (JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            last_error = exc
             sleep_s = _compute_sleep_s(attempt, backoff_base_sec, backoff_cap_sec)
 
             if attempt >= max_attempts:
-                raise
+                break
 
             LOGGER.warning(
                 "Malformed/empty API response for window %s..%s (attempt %s/%s err=%s), sleeping %.2fs",
@@ -192,7 +232,9 @@ def fetch_window_with_retry(
             )
             time.sleep(sleep_s)
 
-    return []
+    raise GdeltRetryExhaustedError(
+        f"Exhausted retries for GDELT window {start_utc.isoformat()}..{end_utc.isoformat()}: {last_error}"
+    ) from last_error
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,10 +246,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-hours", type=int, default=int(os.environ.get("BACKFILL_WINDOW_HOURS", "6")))
     parser.add_argument("--max-records", type=int, default=int(os.environ.get("BACKFILL_MAX_RECORDS", "250")))
     parser.add_argument("--max-events", type=int, default=int(os.environ.get("BACKFILL_MAX_EVENTS", "5000")))
-    parser.add_argument("--min-request-interval-sec", type=float, default=float(os.environ.get("BACKFILL_MIN_REQUEST_INTERVAL_SEC", "1.25")))
-    parser.add_argument("--max-attempts", type=int, default=int(os.environ.get("BACKFILL_MAX_ATTEMPTS", "6")))
-    parser.add_argument("--backoff-base-sec", type=float, default=float(os.environ.get("BACKFILL_BACKOFF_BASE_SEC", "1.5")))
-    parser.add_argument("--backoff-cap-sec", type=float, default=float(os.environ.get("BACKFILL_BACKOFF_CAP_SEC", "45")))
+    parser.add_argument("--min-request-interval-sec", type=float, default=float(os.environ.get("BACKFILL_MIN_REQUEST_INTERVAL_SEC", "2.5")))
+    parser.add_argument("--max-attempts", type=int, default=int(os.environ.get("BACKFILL_MAX_ATTEMPTS", "8")))
+    parser.add_argument("--backoff-base-sec", type=float, default=float(os.environ.get("BACKFILL_BACKOFF_BASE_SEC", "3")))
+    parser.add_argument("--backoff-cap-sec", type=float, default=float(os.environ.get("BACKFILL_BACKOFF_CAP_SEC", "90")))
+    parser.add_argument("--skip-failed-windows", action="store_true", default=os.environ.get("BACKFILL_SKIP_FAILED_WINDOWS", "1") == "1")
+    parser.add_argument("--max-skipped-windows", type=int, default=int(os.environ.get("BACKFILL_MAX_SKIPPED_WINDOWS", "48")))
+    parser.add_argument("--max-consecutive-failed-windows", type=int, default=int(os.environ.get("BACKFILL_MAX_CONSECUTIVE_FAILED_WINDOWS", "12")))
+    parser.add_argument(
+        "--failed-windows-file",
+        default=os.environ.get("BACKFILL_FAILED_WINDOWS_FILE", str(Path.home() / ".cache" / "gdelt_backfill_failed_windows.jsonl")),
+    )
     parser.add_argument("--cursor-file", default=os.environ.get("BACKFILL_CURSOR_FILE", str(Path.home() / ".cache" / "gdelt_backfill_cursor.json")))
     parser.add_argument("--resume", action="store_true", default=os.environ.get("BACKFILL_RESUME", "1") == "1")
     parser.add_argument("--dry-run", action="store_true")
@@ -240,6 +289,34 @@ def _write_cursor(path: Path, cursor: datetime, now_utc: datetime, sent: int) ->
     tmp.replace(path)
 
 
+def _record_failed_window(
+    path: Path,
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    reason: str,
+    error_type: str,
+    skipped: bool,
+    attempts: int,
+    skipped_count: int,
+    consecutive_failures: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "window_start": start_utc.isoformat(),
+        "window_end": end_utc.isoformat(),
+        "attempts": attempts,
+        "error_type": error_type,
+        "error": reason,
+        "skipped": skipped,
+        "skipped_count": skipped_count,
+        "consecutive_failures": consecutive_failures,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -258,6 +335,7 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc)
     default_start = now_utc - timedelta(days=args.days_back)
     cursor_path = Path(args.cursor_file)
+    failed_windows_path = Path(args.failed_windows_file)
     checkpoint_cursor = _load_cursor(cursor_path) if args.resume else None
 
     if checkpoint_cursor and checkpoint_cursor < now_utc:
@@ -269,12 +347,14 @@ def main() -> None:
 
     cursor = start_utc
     sent = 0
+    skipped_windows = 0
+    consecutive_failed_windows = 0
     seen_urls: set[str] = set()
 
     while cursor < now_utc and sent < args.max_events:
         chunk_end = min(cursor + timedelta(hours=args.window_hours), now_utc)
         try:
-            articles = fetch_window_with_retry(
+            window = fetch_window_with_retry(
                 args.query,
                 cursor,
                 chunk_end,
@@ -283,11 +363,68 @@ def main() -> None:
                 backoff_base_sec=args.backoff_base_sec,
                 backoff_cap_sec=args.backoff_cap_sec,
             )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Failed to fetch window %s..%s: %s", cursor.isoformat(), chunk_end.isoformat(), exc)
-            break
+            articles = window.articles
+            consecutive_failed_windows = 0
+            LOGGER.info(
+                "window=%s..%s fetched=%s attempts=%s",
+                cursor.isoformat(),
+                chunk_end.isoformat(),
+                len(articles),
+                window.attempts,
+            )
+        except GdeltBackfillError as exc:
+            consecutive_failed_windows += 1
+            exhausted = isinstance(exc, GdeltRetryExhaustedError)
+            can_skip = args.skip_failed_windows and exhausted and skipped_windows < args.max_skipped_windows
 
-        LOGGER.info("window=%s..%s fetched=%s", cursor.isoformat(), chunk_end.isoformat(), len(articles))
+            _record_failed_window(
+                failed_windows_path,
+                cursor,
+                chunk_end,
+                reason=str(exc),
+                error_type=type(exc).__name__,
+                skipped=can_skip,
+                attempts=args.max_attempts if exhausted else 1,
+                skipped_count=skipped_windows + (1 if can_skip else 0),
+                consecutive_failures=consecutive_failed_windows,
+            )
+
+            if not can_skip:
+                LOGGER.exception(
+                    "Failed to fetch window %s..%s (consecutive_failures=%s skipped_windows=%s). Stopping.",
+                    cursor.isoformat(),
+                    chunk_end.isoformat(),
+                    consecutive_failed_windows,
+                    skipped_windows,
+                )
+                break
+
+            skipped_windows += 1
+            next_cursor = chunk_end + timedelta(seconds=1)
+            _write_cursor(cursor_path, next_cursor, datetime.now(timezone.utc), sent)
+            LOGGER.warning(
+                "Skipping failed window %s..%s and advancing cursor to %s "
+                "(skipped_windows=%s/%s consecutive_failures=%s sent=%s failed_windows_file=%s)",
+                cursor.isoformat(),
+                chunk_end.isoformat(),
+                next_cursor.isoformat(),
+                skipped_windows,
+                args.max_skipped_windows,
+                consecutive_failed_windows,
+                sent,
+                failed_windows_path,
+            )
+            cursor = next_cursor
+
+            if consecutive_failed_windows >= args.max_consecutive_failed_windows:
+                LOGGER.error(
+                    "Reached max consecutive failed windows (%s). Stopping to avoid useless spinning.",
+                    args.max_consecutive_failed_windows,
+                )
+                break
+
+            time.sleep(max(0.0, args.min_request_interval_sec))
+            continue
 
         for article in articles:
             event = build_event(article)
@@ -310,12 +447,26 @@ def main() -> None:
 
         next_cursor = chunk_end + timedelta(seconds=1)
         _write_cursor(cursor_path, next_cursor, datetime.now(timezone.utc), sent)
-        LOGGER.info("progress sent=%s next_cursor=%s cursor_file=%s", sent, next_cursor.isoformat(), cursor_path)
+        LOGGER.info(
+            "progress sent=%s next_cursor=%s skipped_windows=%s consecutive_failures=%s cursor_file=%s",
+            sent,
+            next_cursor.isoformat(),
+            skipped_windows,
+            consecutive_failed_windows,
+            cursor_path,
+        )
 
         cursor = next_cursor
         time.sleep(max(0.0, args.min_request_interval_sec))
 
-    LOGGER.info("Backfill complete sent=%s dry_run=%s topic=%s", sent, args.dry_run, args.topic)
+    LOGGER.info(
+        "Backfill complete sent=%s skipped_windows=%s dry_run=%s topic=%s failed_windows_file=%s",
+        sent,
+        skipped_windows,
+        args.dry_run,
+        args.topic,
+        failed_windows_path,
+    )
 
 
 if __name__ == "__main__":
