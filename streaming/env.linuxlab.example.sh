@@ -40,7 +40,12 @@ export BACKFILL_DAYS="14"
 export BACKFILL_WINDOW_HOURS="6"
 export BACKFILL_MAX_RECORDS="250"
 export BACKFILL_MAX_EVENTS="5000"
-export BACKFILL_SLEEP_MS="500"
+export BACKFILL_MIN_REQUEST_INTERVAL_SEC="1.25"
+export BACKFILL_MAX_ATTEMPTS="6"
+export BACKFILL_BACKOFF_BASE_SEC="1.5"
+export BACKFILL_BACKOFF_CAP_SEC="45"
+export BACKFILL_CURSOR_FILE="$HOME/.cache/gdelt_backfill_cursor.json"
+export BACKFILL_RESUME="1"
 
 # Snowflake (key-pair auth)
 # Keep SNOWFLAKE_AUTHENTICATOR as SNOWFLAKE_JWT for key-pair auth.
@@ -57,3 +62,5 @@ export SNOWFLAKE_PRIVATE_KEY_FILE="$HOME/path/to/rsa_key.p8"
 export COMPANY_ALIAS_TABLE="dim_company_aliases"
 export ARTICLE_MATCH_TABLE="article_company_match"
 export MART_MINUTE_TABLE="mart_company_sentiment_minute"
+
+export ARTICLE_MATCH_BASE_TABLE="article_company_match_base"

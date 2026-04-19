@@ -3,96 +3,14 @@ USE WAREHOUSE MONKEY_WH;
 USE DATABASE MONKEY_DB;
 USE SCHEMA FINAL_PROJECT;
 
--- =========================================================
--- 00_dashboard_setup.sql
---
--- Purpose:
--- Build the reporting tables used by the presentation dashboard.
--- These tables are lightweight, presentation-friendly summaries.
---
--- IMPORTANT:
--- This version is aligned to the new sentiment pipeline and uses
--- ONLY ai_sentiment_v1 wherever sentiment is involved.
--- =========================================================
+-- Bootstraps unified dashboard objects.
+-- Run once (or re-run) after base schema + realtime base objects are present.
 
--- ---------------------------------------------------------
--- Tile 1 source:
--- Company article volume
--- ---------------------------------------------------------
-CREATE OR REPLACE TABLE rpt_company_article_volume AS
-SELECT
-    c.company_id,
-    c.ticker,
-    c.company_name,
-    COUNT(DISTINCT m.article_id) AS article_count,
-    CURRENT_TIMESTAMP() AS refreshed_at
-FROM fact_article_company_mentions m
-JOIN dim_companies c
-  ON m.company_id = c.company_id
-GROUP BY 1, 2, 3;
+-- This script delegates object creation to the unified dynamic-table setup.
+-- After creation, Snowflake auto-refreshes these dynamic tables.
+-- In Snowsight you only need dashboard/tile refresh.
 
--- ---------------------------------------------------------
--- Tile 2b / 2c source:
--- Company sentiment summary using ONLY ai_sentiment_v1
--- ---------------------------------------------------------
-CREATE OR REPLACE TABLE rpt_company_sentiment_summary AS
-SELECT
-    c.company_id,
-    c.ticker,
-    c.company_name,
-    COUNT(*) AS scored_articles,
-    ROUND(AVG(s.sentiment_score), 3) AS avg_sentiment,
-    COUNT_IF(s.sentiment_label = 'positive') AS positive_count,
-    COUNT_IF(s.sentiment_label = 'neutral') AS neutral_count,
-    COUNT_IF(s.sentiment_label = 'negative') AS negative_count,
-    CURRENT_TIMESTAMP() AS refreshed_at
-FROM fact_article_sentiment s
-JOIN dim_companies c
-  ON s.company_id = c.company_id
-WHERE s.model_name = 'ai_sentiment_v1'
-GROUP BY 1, 2, 3;
+-- If your worksheet does not support !source, execute:
+--   snowflake/09_create_unified_realtime_reporting.sql
 
--- ---------------------------------------------------------
--- Tile 3 source:
--- Daily trend using the already refreshed mart
--- The mart itself should already have been built from ai_sentiment_v1
--- ---------------------------------------------------------
-CREATE OR REPLACE TABLE rpt_daily_trend AS
-SELECT
-    metric_date,
-    SUM(article_count) AS total_articles,
-    ROUND(AVG(avg_sentiment), 3) AS avg_sentiment_across_companies,
-    CURRENT_TIMESTAMP() AS refreshed_at
-FROM mart_company_sentiment_daily
-GROUP BY 1;
-
--- ---------------------------------------------------------
--- Optional presentation/Q&A support tile:
--- strongest sentiment examples
--- ---------------------------------------------------------
-CREATE OR REPLACE TABLE rpt_sentiment_examples AS
-SELECT
-    c.ticker,
-    c.company_name,
-    s.sentiment_label,
-    s.sentiment_score,
-    a.published_at,
-    a.source_name,
-    a.title,
-    a.url,
-    s.reasoning,
-    CURRENT_TIMESTAMP() AS refreshed_at
-FROM fact_article_sentiment s
-JOIN dim_companies c
-  ON s.company_id = c.company_id
-JOIN raw_articles a
-  ON s.article_id = a.article_id
-WHERE s.model_name = 'ai_sentiment_v1';
-
--- ---------------------------------------------------------
--- Optional quick verification
--- ---------------------------------------------------------
-SELECT * FROM rpt_company_article_volume ORDER BY article_count DESC;
-SELECT * FROM rpt_company_sentiment_summary ORDER BY scored_articles DESC, ticker;
-SELECT * FROM rpt_daily_trend ORDER BY metric_date DESC;
-SELECT * FROM rpt_sentiment_examples ORDER BY ABS(sentiment_score) DESC LIMIT 20;
+SELECT 'Run snowflake/09_create_unified_realtime_reporting.sql in this worksheet session.' AS next_step;

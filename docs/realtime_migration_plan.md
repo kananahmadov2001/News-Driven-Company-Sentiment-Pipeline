@@ -1,98 +1,48 @@
-# Real-Time Migration Plan (Airflow Batch -> Kafka + Spark Streaming)
+# Realtime pipeline status and operating model (April 2026)
 
-## Why migrate
-Your existing Snowflake model and downstream dashboard logic are already valuable. The migration focuses on **upstream ingestion and processing latency**:
+## Current state on main
 
-- Keep Snowflake warehouse + core tables.
-- Shift acquisition from Airflow-triggered batch pulls to continuous event ingestion.
-- Process articles continuously in micro-batches (near-real-time, class-appropriate).
+Implemented and preserved:
+- LinuxLab Kafka startup/check scripts under `streaming/scripts/*`.
+- Spark Structured Streaming `kafka -> foreachBatch -> Snowflake connector` ingestion.
+- Proven Snowflake connector options: `quote_identifiers=False`, `use_logical_type=True`.
+- Canonical append-only base table foundation: `article_company_match_base` + duplicate visibility view.
+- GDELT backfill and live producer paths; smoke producer path.
 
-This supports CSE 5114's real-time/distributed systems requirement while preserving prior work.
+Completed in this implementation:
+- Upgraded Spark sentiment from tiny keyword baseline to VADER.
+- Added resilient GDELT backfill behavior (rate limit, 429 handling, Retry-After, jittered backoff, resumable cursor).
+- Added Snowflake unified dynamic-table reporting layer combining legacy NewsAPI/old data with realtime stream data.
+- Updated runbooks for the 3-terminal LinuxLab session model.
 
-## Target architecture
+## Final architecture
 
-1. **Producer layer (Python service)**
-   - Poll source APIs/feeds every 30-60 seconds.
-   - Detect unseen articles (URL hash/event id dedup).
-   - Publish normalized events to Kafka topic: `raw_news_articles`.
+1. Producer(s) -> Kafka topic `raw_news_articles`
+2. Spark Structured Streaming consumes Kafka and appends to Snowflake base sinks
+3. Snowflake dynamic tables maintain unified dashboard objects
+4. Snowsight dashboards query `rpt_*` dynamic tables
 
-2. **Streaming processor (Spark Structured Streaming)**
-   - Consume Kafka events.
-   - Clean and normalize fields.
-   - Deduplicate stories.
-   - Match article text to companies (aliases from Snowflake).
-   - Compute sentiment score.
-   - Write article-level and aggregate outputs to Snowflake.
+## Why dynamic tables here
 
-3. **Serving/storage layer (Snowflake)**
-   - `article_company_match` (article -> company + sentiment)
-   - `mart_company_sentiment_minute` (rolling minute aggregates)
-   - `mart_company_sentiment_hour` (hourly aggregates)
-   - Existing dashboard queries can pivot from daily to minute/hour marts.
+Chosen approach: **append-only Spark base writes + Snowflake dynamic tables**.
 
-## Demo-ready operating model
+Reasoning:
+- Keeps Spark ingest path simple and durable.
+- Removes per-session manual SQL for downstream marts.
+- Handles restart/recompute predictably in Snowflake.
+- Works with mixed legacy + realtime inputs through one unified reporting grain.
 
-For LinuxLab's limited session duration, run this sequence:
+## LinuxLab session checklist
 
-1. **Smoke path**: publish exactly one synthetic event with Python to prove Kafka -> Spark -> Snowflake.
-2. **Backfill path**: run one-shot GDELT backfill for 7/14/30 days (configurable caps) to preload demo data.
-3. **Live tail path**: keep GDELT live producer running for near-real-time updates.
+1. `server-airflow25 -c 4`
+2. Start Kafka terminal
+3. Start Spark terminal
+4. Start backfill/live terminal
+5. In Snowsight, refresh dashboard tiles only
 
-This avoids demo risk from quiet external feeds while still satisfying real-time architecture goals.
+## Session loss behavior
 
-## Why Spark for this project
-- Team is already using Python and SQL-centric transformations.
-- Structured Streaming offers a familiar DataFrame model.
-- Near-real-time micro-batch cadence (30-60 sec) is easy to explain and defend.
-- Lower operational complexity than full Flink adoption for class timeline.
-
-## Migration phases (recommended)
-
-### Phase 1: Parallel path (1-2 days)
-- Keep Airflow DAG active as fallback.
-- Stand up Kafka topic + run producer script.
-- Validate event counts and duplicate rate.
-
-### Phase 2: Streaming job + dual-write validation (2-4 days)
-- Run Spark micro-batch job every ~45 seconds.
-- Load to new realtime mart tables.
-- Compare daily rollups from streaming vs current Airflow outputs.
-
-### Phase 3: Cutover (1 day)
-- Update dashboard to read realtime marts.
-- Reduce Airflow job to backup/reconciliation mode.
-- Add quick runbook for restart/recovery.
-
-## Operational expectations
-- **Latency target**: 1-2 minutes from source publish to Snowflake mart update.
-- **Fault tolerance**:
-  - Kafka retains raw events for replay.
-  - Spark checkpoint directory enables restart without data loss.
-- **Quality controls**:
-  - URL hash dedup + event_id dedup.
-  - Null/invalid field filtering.
-  - Periodic reconciliation query against raw events.
-
-## Files added in this repo
-- `streaming/producer/news_producer.py` - source polling publisher to Kafka.
-- `streaming/producer/smoke_event_producer.py` - one-shot synthetic event publisher.
-- `streaming/producer/gdelt_backfill.py` - one-shot historical backfill publisher.
-- `streaming/processor/spark_news_stream.py` - Spark streaming processor to Snowflake.
-- `streaming/sql/01_create_realtime_tables.sql` - realtime table DDL.
-- `streaming/requirements.txt` - Python dependencies.
-
-## Suggested demo narrative for presentation
-1. Show smoke event arriving end-to-end.
-2. Show backfill preloading enough historical examples.
-3. Show live producer publishing new updates.
-4. Show minute-level Snowflake aggregates updating.
-
-## LinuxLab alignment notes (April 2026)
-
-- Execution environment is LinuxLab with session bootstrap:
-  `server-airflow25 -c 4`.
-- Kafka + Spark use shared installs at `/opt/kafka` and `/opt/spark`.
-- Spark submit should use standalone master URL:
-  `spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}`.
-- Snowflake writes in the streaming processor are intentionally via the Python connector path in `foreachBatch`, not Spark Snowflake connector.
-- GDELT is the preferred practical source for live-ish demo and backfill; smoke producer remains the deterministic fallback demo path.
+- Snowflake rows written before failure remain safe.
+- Restart Spark with same checkpoint path.
+- Restart backfill; cursor checkpoint resumes from last saved window boundary.
+- Dynamic tables continue from persisted base tables.

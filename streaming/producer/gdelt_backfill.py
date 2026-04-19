@@ -1,6 +1,8 @@
-"""One-shot GDELT historical backfill producer.
+"""Long-running GDELT historical backfill producer.
 
-Fetches older articles from GDELT and publishes normalized events to Kafka.
+Fetches historical articles from GDELT in non-overlapping windows and publishes
+normalized events to Kafka. Includes safe rate limiting, retry/backoff, and
+resumable local cursor checkpoints for LinuxLab sessions.
 """
 
 from __future__ import annotations
@@ -8,13 +10,21 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
+import random
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 from kafka import KafkaProducer
+
+
+LOGGER = logging.getLogger("gdelt_backfill")
 
 
 def dt_to_gdelt(value: datetime) -> str:
@@ -55,17 +65,73 @@ def build_event(article: dict) -> dict | None:
     return payload
 
 
-def fetch_window(query: str, start_utc: datetime, end_utc: datetime, max_records: int) -> list[dict]:
+def _parse_retry_after(header_value: Optional[str]) -> Optional[float]:
+    if not header_value:
+        return None
+    try:
+        return max(0.0, float(header_value))
+    except ValueError:
+        return None
+
+
+def fetch_window_with_retry(
+    query: str,
+    start_utc: datetime,
+    end_utc: datetime,
+    max_records: int,
+    max_attempts: int,
+    backoff_base_sec: float,
+    backoff_cap_sec: float,
+) -> list[dict]:
     encoded = quote_plus(query)
     url = (
         "https://api.gdeltproject.org/api/v2/doc/doc"
         f"?query={encoded}&mode=ArtList&format=json&maxrecords={max_records}&sort=datedesc"
         f"&startdatetime={dt_to_gdelt(start_utc)}&enddatetime={dt_to_gdelt(end_utc)}"
     )
-    req = Request(url)
-    with urlopen(req, timeout=45) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    return payload.get("articles", [])
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = Request(url)
+            with urlopen(req, timeout=45) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return payload.get("articles", [])
+        except HTTPError as exc:
+            retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
+            if exc.code == 429 and retry_after is not None:
+                sleep_s = min(backoff_cap_sec, retry_after + random.uniform(0, 0.75))
+            else:
+                sleep_s = min(backoff_cap_sec, backoff_base_sec * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
+
+            if attempt >= max_attempts:
+                raise
+
+            LOGGER.warning(
+                "HTTP error for window %s..%s (attempt %s/%s code=%s), sleeping %.2fs",
+                start_utc.isoformat(),
+                end_utc.isoformat(),
+                attempt,
+                max_attempts,
+                exc.code,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+        except URLError as exc:
+            sleep_s = min(backoff_cap_sec, backoff_base_sec * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
+            if attempt >= max_attempts:
+                raise
+            LOGGER.warning(
+                "Network error for window %s..%s (attempt %s/%s err=%s), sleeping %.2fs",
+                start_utc.isoformat(),
+                end_utc.isoformat(),
+                attempt,
+                max_attempts,
+                exc,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+
+    return []
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,13 +143,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--window-hours", type=int, default=int(os.environ.get("BACKFILL_WINDOW_HOURS", "6")))
     parser.add_argument("--max-records", type=int, default=int(os.environ.get("BACKFILL_MAX_RECORDS", "250")))
     parser.add_argument("--max-events", type=int, default=int(os.environ.get("BACKFILL_MAX_EVENTS", "5000")))
-    parser.add_argument("--sleep-ms", type=int, default=int(os.environ.get("BACKFILL_SLEEP_MS", "500")))
+    parser.add_argument("--min-request-interval-sec", type=float, default=float(os.environ.get("BACKFILL_MIN_REQUEST_INTERVAL_SEC", "1.25")))
+    parser.add_argument("--max-attempts", type=int, default=int(os.environ.get("BACKFILL_MAX_ATTEMPTS", "6")))
+    parser.add_argument("--backoff-base-sec", type=float, default=float(os.environ.get("BACKFILL_BACKOFF_BASE_SEC", "1.5")))
+    parser.add_argument("--backoff-cap-sec", type=float, default=float(os.environ.get("BACKFILL_BACKOFF_CAP_SEC", "45")))
+    parser.add_argument("--cursor-file", default=os.environ.get("BACKFILL_CURSOR_FILE", str(Path.home() / ".cache" / "gdelt_backfill_cursor.json")))
+    parser.add_argument("--resume", action="store_true", default=os.environ.get("BACKFILL_RESUME", "1") == "1")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     return parser.parse_args()
+
+
+def _load_cursor(path: Path) -> Optional[datetime]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        value = payload.get("next_cursor")
+        if not value:
+            return None
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def _write_cursor(path: Path, cursor: datetime, now_utc: datetime, sent: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "next_cursor": cursor.isoformat(),
+        "updated_at": now_utc.isoformat(),
+        "sent_events": sent,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(path)
 
 
 def main() -> None:
     args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
     producer = KafkaProducer(
         bootstrap_servers=[part.strip() for part in args.kafka_bootstrap.split(",")],
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
@@ -93,15 +195,38 @@ def main() -> None:
     )
 
     now_utc = datetime.now(timezone.utc)
-    start_utc = now_utc - timedelta(days=args.days_back)
+    default_start = now_utc - timedelta(days=args.days_back)
+    cursor_path = Path(args.cursor_file)
+    checkpoint_cursor = _load_cursor(cursor_path) if args.resume else None
+
+    if checkpoint_cursor and checkpoint_cursor < now_utc:
+        start_utc = checkpoint_cursor
+        LOGGER.info("Resuming backfill from cursor %s", start_utc.isoformat())
+    else:
+        start_utc = default_start
+        LOGGER.info("Starting backfill from days-back window %s", start_utc.isoformat())
+
     cursor = start_utc
     sent = 0
     seen_urls: set[str] = set()
 
     while cursor < now_utc and sent < args.max_events:
         chunk_end = min(cursor + timedelta(hours=args.window_hours), now_utc)
-        articles = fetch_window(args.query, cursor, chunk_end, args.max_records)
-        print(f"window={cursor.isoformat()}..{chunk_end.isoformat()} fetched={len(articles)}")
+        try:
+            articles = fetch_window_with_retry(
+                args.query,
+                cursor,
+                chunk_end,
+                args.max_records,
+                max_attempts=args.max_attempts,
+                backoff_base_sec=args.backoff_base_sec,
+                backoff_cap_sec=args.backoff_cap_sec,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.exception("Failed to fetch window %s..%s: %s", cursor.isoformat(), chunk_end.isoformat(), exc)
+            break
+
+        LOGGER.info("window=%s..%s fetched=%s", cursor.isoformat(), chunk_end.isoformat(), len(articles))
 
         for article in articles:
             event = build_event(article)
@@ -121,10 +246,15 @@ def main() -> None:
 
         if not args.dry_run:
             producer.flush()
-        time.sleep(max(0, args.sleep_ms) / 1000.0)
-        cursor = chunk_end
 
-    print(f"Backfill complete sent={sent} dry_run={args.dry_run} topic={args.topic}")
+        next_cursor = chunk_end + timedelta(seconds=1)
+        _write_cursor(cursor_path, next_cursor, datetime.now(timezone.utc), sent)
+        LOGGER.info("progress sent=%s next_cursor=%s cursor_file=%s", sent, next_cursor.isoformat(), cursor_path)
+
+        cursor = next_cursor
+        time.sleep(max(0.0, args.min_request_interval_sec))
+
+    LOGGER.info("Backfill complete sent=%s dry_run=%s topic=%s", sent, args.dry_run, args.topic)
 
 
 if __name__ == "__main__":
