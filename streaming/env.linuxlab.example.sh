@@ -8,6 +8,8 @@ export SPARK_HOME="/opt/spark"
 export KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
 export RAW_ARTICLES_TOPIC="raw_news_articles"
 export BACKFILL_TOPIC="raw_news_articles"
+export KAFKA_TOPIC_PARTITIONS="3"
+export KAFKA_TOPIC_REPLICATION_FACTOR="1"
 
 # LinuxLab Spark standalone master URL pattern:
 #   spark://${SLURMD_NODENAME}:${SPARK_MASTER_PORT}
