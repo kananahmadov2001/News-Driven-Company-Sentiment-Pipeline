@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
+from json import JSONDecodeError
 
 from kafka import KafkaProducer
 
@@ -74,6 +75,17 @@ def _parse_retry_after(header_value: Optional[str]) -> Optional[float]:
         return None
 
 
+def _compute_sleep_s(
+    attempt: int,
+    backoff_base_sec: float,
+    backoff_cap_sec: float,
+    retry_after: Optional[float] = None,
+) -> float:
+    if retry_after is not None:
+        return min(backoff_cap_sec, retry_after + random.uniform(0, 0.75))
+    return min(backoff_cap_sec, backoff_base_sec * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
+
+
 def fetch_window_with_retry(
     query: str,
     start_utc: datetime,
@@ -92,16 +104,45 @@ def fetch_window_with_retry(
 
     for attempt in range(1, max_attempts + 1):
         try:
-            req = Request(url)
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "cse5114-final-project-gdelt-backfill/1.0",
+                    "Accept": "application/json,text/plain,*/*",
+                },
+            )
+
             with urlopen(req, timeout=45) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            return payload.get("articles", [])
+                body_bytes = response.read()
+
+            if not body_bytes:
+                raise ValueError("Empty response body from GDELT")
+
+            body_text = body_bytes.decode("utf-8", errors="replace").strip()
+            if not body_text:
+                raise ValueError("Blank response body from GDELT")
+
+            payload = json.loads(body_text)
+
+            if not isinstance(payload, dict):
+                raise ValueError(f"Unexpected non-object JSON payload type: {type(payload).__name__}")
+
+            articles = payload.get("articles", [])
+            if articles is None:
+                return []
+            if not isinstance(articles, list):
+                raise ValueError(f"Unexpected 'articles' type: {type(articles).__name__}")
+
+            return articles
+
         except HTTPError as exc:
             retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
-            if exc.code == 429 and retry_after is not None:
-                sleep_s = min(backoff_cap_sec, retry_after + random.uniform(0, 0.75))
-            else:
-                sleep_s = min(backoff_cap_sec, backoff_base_sec * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
+            sleep_s = _compute_sleep_s(
+                attempt,
+                backoff_base_sec,
+                backoff_cap_sec,
+                retry_after=retry_after if exc.code == 429 else None,
+            )
 
             if attempt >= max_attempts:
                 raise
@@ -116,12 +157,32 @@ def fetch_window_with_retry(
                 sleep_s,
             )
             time.sleep(sleep_s)
+
         except URLError as exc:
-            sleep_s = min(backoff_cap_sec, backoff_base_sec * (2 ** (attempt - 1)) + random.uniform(0, 0.75))
+            sleep_s = _compute_sleep_s(attempt, backoff_base_sec, backoff_cap_sec)
+
             if attempt >= max_attempts:
                 raise
+
             LOGGER.warning(
                 "Network error for window %s..%s (attempt %s/%s err=%s), sleeping %.2fs",
+                start_utc.isoformat(),
+                end_utc.isoformat(),
+                attempt,
+                max_attempts,
+                exc,
+                sleep_s,
+            )
+            time.sleep(sleep_s)
+
+        except (JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            sleep_s = _compute_sleep_s(attempt, backoff_base_sec, backoff_cap_sec)
+
+            if attempt >= max_attempts:
+                raise
+
+            LOGGER.warning(
+                "Malformed/empty API response for window %s..%s (attempt %s/%s err=%s), sleeping %.2fs",
                 start_utc.isoformat(),
                 end_utc.isoformat(),
                 attempt,
