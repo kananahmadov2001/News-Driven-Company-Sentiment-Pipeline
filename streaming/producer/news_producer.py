@@ -1,7 +1,6 @@
 """Lightweight article producer.
 
 Polls one or more upstream sources and publishes normalized article events to Kafka.
-Designed for near-real-time ingestion (every 30-60 seconds).
 """
 
 from __future__ import annotations

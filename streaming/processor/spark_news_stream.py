@@ -4,7 +4,7 @@ Pipeline stages:
 1. Read raw article events from Kafka topic raw_news_articles.
 2. Clean/normalize fields and deduplicate by URL hash.
 3. Perform company matching using alias dimension loaded from Snowflake.
-4. Compute sentiment score with VADER (rule-based, robust for headlines).
+4. Compute sentiment score with VADER.
 5. Append batch outputs into Snowflake base and compatibility tables.
 """
 
